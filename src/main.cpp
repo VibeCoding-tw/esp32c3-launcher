@@ -146,7 +146,8 @@ void setup() {
         // 只有在成功連網狀態下才啟動 OTA 和 mDNS
         
         // 2. Setup mDNS and OTA
-        String hostname = "esp32c3-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+        String hostname = "esp32c3-" + String(WiFi.macAddress());
+        hostname.replace(":", ""); // remove colons for clean name
         if (MDNS.begin(hostname.c_str())) {
             Serial.printf("mDNS responder started: %s.local\n", hostname.c_str());
         }
