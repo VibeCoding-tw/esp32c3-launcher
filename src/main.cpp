@@ -348,7 +348,7 @@ void handleControl(AsyncWebServerRequest *request) {
         setMotorT(speed_Throttle); // Motor T: 速度        
         setMotorS(speed_Steering); // Motor S: 轉向
 
-        Serial.printf("WebControl: A馬達(速度)=%d, B馬達(轉向)=%d\n", speed_Throttle, speed_Steering);        
+        Serial.printf("WebControl: T馬達(速度)=%d, S馬達(轉向)=%d\n", speed_Throttle, speed_Steering);        
         request->send(200, "text/plain", "OK"); // 使用 AsyncWebServer 的 send ***
     } else {
         request->send(400, "text/plain", "Invalid arguments (Missing t or s)");
