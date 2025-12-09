@@ -1,5 +1,4 @@
 // 包含必要的庫
-#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>               // Web Server
 #include <ArduinoOTA.h>              // 透過網路進行韌體更新
@@ -7,79 +6,168 @@
 #include "esp_ota_ops.h"             // OTA 相關操作
 #include "esp_partition.h"           // 分區表操作
 #include "esp_task_wdt.h"            // Watchdog Timer 函式庫
-#include "esp32c3_gpio.h"            // 假設此處定義了 GPIO 腳位 (例如: AIN1_PIN, NSLEEP_PIN)
+#include "esp32c3_gpio.h" // 假設此處定義了 AIN1_PIN, AIN2_PIN, BIN1_PIN, BIN2_PIN, NSLEEP_PIN
 
-// --- 【BLE 核心變更】替換為 Bluedroid 庫 ---
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <Preferences.h>             // 用於儲存 Wi-Fi 憑證
-#include <freertos/FreeRTOS.h>       // 繼續使用 FreeRTOS 任務功能
-#include <freertos/task.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h> // 用於儲存 BLE 接收到的 Wi-Fi 憑證
 
 // --- 全域變數 ---
 String globalHostname;              // 基於 MAC 位址的唯一 Hostname
 WebServer server(80);                // 實例化同步 Web Server
+// 【已移除】 WiFiManager wm;                      // 實例化同步 WiFiManager
 
-// LEDC PWM 設定 (保持不變)
-const int PWM_FREQ = 20000;
-const int PWM_RESOLUTION = 8;
-const int PWM_MAX = 255;
-const int LEDC_CH_A1 = 0;
-const int LEDC_CH_A2 = 1;
-const int LEDC_CH_B1 = 2;
-const int LEDC_CH_B2 = 3;
+// LEDC PWM 設定
+const int PWM_FREQ = 20000;        // 頻率 (Hz)
+const int PWM_RESOLUTION = 8;      // 解析度 8-bit (0-255)
+const int PWM_MAX = 255;           // PWM 訊號最大值 (2^8 - 1)
+
+// PWM 通道 (用於 DRV8833 的四個輸入腳)
+const int LEDC_CH_A1 = 0;          // 馬達 T (速度) - AIN1
+const int LEDC_CH_A2 = 1;          // 馬達 T (速度) - AIN2
+const int LEDC_CH_B1 = 2;          // 馬達 S (轉向) - BIN1
+const int LEDC_CH_B2 = 3;          // 馬達 S (轉向) - BIN2
 
 // --- 馬達 Ramping 核心變數 ---
-volatile unsigned long lastControlTime = 0; // 上次接收到控制命令的時間戳記
-const unsigned long CONTROL_TIMEOUT_MS = 1000; // 1000 毫秒 = 1 秒超時
-volatile int targetSpeedT = 0;
-volatile int currentSpeedT = 0;
-volatile int targetSpeedS = 0;
-volatile int currentSpeedS = 0;
-const int RAMP_INTERVAL_MS = 10;
+volatile int targetSpeedT = 0;     // 速度馬達的目標速度 (-255 到 255)
+volatile int currentSpeedT = 0;    // 速度馬達的實際輸出速度 (-255 到 255)
+volatile int targetSpeedS = 0;     // 轉向馬達的目標速度 (-255 到 255)
+volatile int currentSpeedS = 0;    // 轉向馬達的實際輸出速度 (-255 到 255)
+
+// --- 速度過渡配置 ---
+const int RAMP_INTERVAL_MS = 10;    // 每 10ms 檢查一次 PWM 速度
 unsigned long lastRampTime = 0;
-const int PWM_EFFECTIVE_LIMIT_T = 250; //200; 
+
+// --- T 馬達 (速度/Throttle) Ramping 參數 ---
+const int PWM_EFFECTIVE_LIMIT_T = 200; 
 const int RAMP_ACCEL_STEP_T = 5; 
-const int PWM_START_KICK_T = 200; //128;
+const int PWM_START_KICK_T = 128;
+
+// --- S 馬達 (轉向/Steering) Ramping 參數 ---
 const int PWM_EFFECTIVE_LIMIT_S = 250; 
-const int RAMP_ACCEL_STEP_S = 5; //20; 
-const int PWM_START_KICK_S = 200; //150;
+const int RAMP_ACCEL_STEP_S = 20; 
+const int PWM_START_KICK_S = 150;
 
-// --- BLE UUID 定義 ---
-const char* CONFIG_SERVICE_UUID_BASE  = "0000FFFF-0000-1000-8000-000000000000"; 
-const char* CONTROL_SERVICE_UUID_BASE = "4FAFC201-1FB5-459E-8FCC-000000000000";
+// --- BLE UUID 定義 (使用 MAC 嵌入模板) ---
+#define CONFIG_SERVICE_UUID_BASE  "0000FFFF-0000-1000-8000-ZZZZZZZZZZZZ" 
+#define CONTROL_SERVICE_UUID_BASE "4FAFC201-1FB5-459E-8FCC-ZZZZZZZZZZZZ"
 
-// 特徵 (Characteristic)
-#define SSID_CHAR_UUID          "0000FFFF-0000-1000-8000-000000000001"
-#define PASS_CHAR_UUID          "0000FFFF-0000-1000-8000-000000000002"
-#define CONTROL_CHAR_UUID       "4FAFC201-1FB5-459E-8FCC-000000000000"
+// 3. 特徵 (Characteristic) - 僅使用短 UUID，避免衝突
+#define SSID_CHAR_UUID          "FF01"
+#define PASS_CHAR_UUID          "FF02"
+#define CONTROL_CHAR_UUID       "B26A" 
 
 // --- 程式碼動態生成 ---
+// 在全域變數中，定義實際的 UUID 字串變數：
 String configServiceUUID;
 String controlServiceUUID;
 
-// --- 全域變數：BLE / NVS ---
-Preferences preferences; 
-BLEServer *pServer = NULL;
-BLECharacteristic *pControlCharacteristic = NULL;
-BLECharacteristic *pSsidCharacteristic = NULL;
-BLECharacteristic *pPassCharacteristic = NULL;
+// 輔助函數：將 MAC Address 格式化並嵌入 UUID
+void generateUniqueUuids() {
+    // 獲取並清理 MAC Address (例如: "AABBCCDDEEFF")
+    String macAddr = WiFi.macAddress(); 
+    macAddr.replace(":", ""); 
+    macAddr.toUpperCase(); 
+
+    // 取 MAC Address 的後半部分 (DD EE FF)
+    String mac_suffix = macAddr.substring(6); 
+    
+    // --- 構建服務 UUID ---
+    
+    // CONFIG_SERVICE_UUID
+    configServiceUUID = CONFIG_SERVICE_UUID_BASE;
+    // 將 BASE UUID 末尾的 ZZZ... 替換為 MAC Address
+    configServiceUUID.replace("ZZZZZZZZZZZZ", macAddr);
+
+    // CONTROL_SERVICE_UUID
+    controlServiceUUID = CONTROL_SERVICE_UUID_BASE;
+    // 將 BASE UUID 末尾的 ZZZ... 替換為 MAC Address
+    controlServiceUUID.replace("ZZZZZZZZZZZZ", macAddr);
+    
+    Serial.printf("Unique Config Service UUID: %s\n", configServiceUUID.c_str());
+    Serial.printf("Unique Control Service UUID: %s\n", controlServiceUUID.c_str());
+}
+
+// --- 全域變數 ---
+Preferences preferences; // 用於儲存 Wi-Fi 憑證
+
+NimBLEServer *pServer = NULL;
+NimBLECharacteristic *pControlCharacteristic = NULL;
+NimBLECharacteristic *pSsidCharacteristic = NULL;
+NimBLECharacteristic *pPassCharacteristic = NULL;
+
+// Wi-Fi 憑證暫存
 String ble_ssid;
 String ble_pass;
 bool wifi_config_received = false;
-volatile bool should_restart_advertising = false;
-bool servicesStarted = false;
 
-// --- HTML 網頁內容 (保持不變) ---
+// --- BLE 連線狀態回調 ---
+class MyServerCallbacks: public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) {
+        Serial.println("BLE Client Connected.");
+    }
+    void onDisconnect(NimBLEServer* pServer) {
+        Serial.println("BLE Client Disconnected. Restarting Advertising...");
+        vTaskDelay(pdMS_TO_TICKS(10));
+        pServer->startAdvertising(); // 重新啟動廣告
+    }
+};
+
+// --- BLE 特徵寫入回調 ---
+class MyCharacteristicCallbacks: public NimBLECharacteristicCallbacks {
+    // 處理馬達控制指令
+    void onWrite(NimBLECharacteristic* pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        if (rxValue.length() > 0) {
+            String command = String(rxValue.c_str());
+            Serial.printf("[BLE CMD] Received: %s\n", command.c_str());
+            
+            // 語義共用：將 BLE 指令轉換為與 Wi-Fi 相同的 (T, S) 參數
+            // 假設 BLE 傳輸格式為 "T,S" (例如: "150,50" 或 "-100,-20")
+            int commaIndex = command.indexOf(',');
+            if (commaIndex > 0) {
+                int rawT = command.substring(0, commaIndex).toInt();
+                int rawS = command.substring(commaIndex + 1).toInt();
+
+                // 導向與 Wi-Fi handleControl 相同的邏輯
+                targetSpeedT = constrain(rawT, -PWM_EFFECTIVE_LIMIT_T, PWM_EFFECTIVE_LIMIT_T); 
+                targetSpeedS = constrain(rawS, -PWM_EFFECTIVE_LIMIT_S, PWM_EFFECTIVE_LIMIT_S);
+            }
+        }
+    }
+};
+
+// --- BLE 配置回調 (接收 Wi-Fi 憑證) ---
+class ConfigCharacteristicCallbacks: public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        if (rxValue.length() > 0) {
+            String data = String(rxValue.c_str());
+            
+            if (pCharacteristic == pSsidCharacteristic) {
+                ble_ssid = data;
+                Serial.printf("[BLE Config] Received SSID: %s\n", ble_ssid.c_str());
+            } else if (pCharacteristic == pPassCharacteristic) {
+                ble_pass = data;
+                Serial.println("[BLE Config] Received Password.");
+                
+                // SSID 和 PASS 都收到，觸發 Wi-Fi 儲存邏輯
+                if (ble_ssid.length() > 0) {
+                    wifi_config_received = true; 
+                    Serial.println("BLE 配置完成，準備儲存 Wi-Fi 憑證...");
+                }
+            }
+        }
+    }
+};
+
+// --- HTML 網頁內容 (內嵌虛擬搖桿) ---
 const char* HTML_CONTENT = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VibeRcer 搖桿控制</title>
+    <title>ESP32 馬達搖桿控制</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         /* 確保全螢幕高度和柔軟的背景色 */
@@ -175,10 +263,16 @@ const char* HTML_CONTENT = R"rawliteral(
         let controlInterval;
         let lastMotorT = 0; // 上次發送的 T 馬達速度
         let lastMotorS = 0; // 上次發送的 S 馬達速度
+
+        // 檢查當前 IP，用於 AP 模式下的絕對路徑
+        const currentIP = document.getElementById('ipaddress').textContent;
+        // 由於移除了 WiFiManager 的 AP 模式，這裡的檢查已簡化
         const baseIp = ''; 
         
         /**
          * @brief 根據搖桿位置 (Cartesian 座標) 計算並發送馬達速度。
+         * @param rawX X 軸位移 (Cartesian: 右為正)
+         * @param rawY Y 軸位移 (Cartesian: 上為正)
          */
         function updateMotorValues(rawX, rawY) {
             
@@ -191,7 +285,7 @@ const char* HTML_CONTENT = R"rawliteral(
             const normX = magnitude * Math.cos(angle); // 轉向 (Steering)
             const normY = magnitude * Math.sin(angle); // 速度 (Throttle)
 
-            // 3. 轉換為 -255 到 255 的整數
+            // 3. 轉換為 -255 到 255 的整數 (注意：ESP32 端會將 255 限制為 230)
             let speedT = Math.round(normY * 255);
             let speedS = Math.round(normX * 255);
 
@@ -234,7 +328,7 @@ const char* HTML_CONTENT = R"rawliteral(
         }
 
         function sendControl(T, S) {
-            // 使用非同步請求發送馬達速度
+            // 使用非同步請求發送馬達速度 (fetch 依然可用於同步 Web Server)
             fetch(`${baseIp}/control?t=${T}&s=${S}`, { method: 'GET' })
                 .then(response => {
                     if (!response.ok) {
@@ -323,6 +417,7 @@ const char* HTML_CONTENT = R"rawliteral(
 
         joystick.addEventListener('touchstart', handleStart);
         document.addEventListener('touchmove', handleMove);
+        // 觸摸結束可能在搖桿外，監聽大容器確保停止命令發出
         joystickContainer.addEventListener('touchend', handleEnd); 
 
         // 初始化時發送一次停止命令
@@ -340,57 +435,47 @@ void generateHostname() {
     Serial.printf("Generated Hostname: %s\n", globalHostname.c_str());
 }
 
-// 輔助函數：將 MAC Address 格式化並嵌入 UUID
-void generateUniqueUuids() {
-    String macAddr = WiFi.macAddress(); 
-    macAddr.replace(":", ""); 
-    macAddr.toUpperCase(); 
-
-    // CONFIG_SERVICE_UUID
-    configServiceUUID = CONFIG_SERVICE_UUID_BASE;
-    configServiceUUID.replace("ZZZZZZZZZZZZ", macAddr);
-
-    // CONTROL_SERVICE_UUID
-    controlServiceUUID = CONTROL_SERVICE_UUID_BASE;
-    controlServiceUUID.replace("ZZZZZZZZZZZZ", macAddr);
-    
-    Serial.printf("Config Service UUID: %s\n", configServiceUUID.c_str());
-    Serial.printf("Control Service UUID: %s\n", controlServiceUUID.c_str());
-}
-
 // --- 輔助函數: 實際寫入 PWM 值 ---
 void setMotorPwm(int speedT, int speedS) {
     // T 馬達 (速度)
     if (speedT > 0) { 
+        // Forward
         ledcWrite(LEDC_CH_A1, speedT);
         ledcWrite(LEDC_CH_A2, 0);
     } else if (speedT < 0) { 
+        // Reverse
         ledcWrite(LEDC_CH_A1, 0);
         ledcWrite(LEDC_CH_A2, -speedT); 
     } else { 
+        // STOP: Coast mode (IN1=LOW, IN2=LOW)
         ledcWrite(LEDC_CH_A1, 0);
         ledcWrite(LEDC_CH_A2, 0);
     }
 
     // S 馬達 (轉向)
-    if (speedS > 0) { 
+    if (speedS > 0) { // 正值: 右轉 (BIN1 LOW, BIN2 HIGH)
         ledcWrite(LEDC_CH_B1, 0);
         ledcWrite(LEDC_CH_B2, speedS);
-    } else if (speedS < 0) { 
+    } else if (speedS < 0) { // 負值: 左轉 (BIN1 HIGH, BIN2 LOW)
         ledcWrite(LEDC_CH_B1, -speedS); 
         ledcWrite(LEDC_CH_B2, 0);
     } else { 
+        // STOP: Coast mode (IN1=LOW, IN2=LOW)
         ledcWrite(LEDC_CH_B1, 0);
         ledcWrite(LEDC_CH_B2, 0);
     }
 }
 
-// --- 定時馬達 Ramping 任務 ---
+// --- 定時馬達 Ramping 任務 (T 和 S 獨立參數) ---
 void motorRampTask() {
     if (millis() - lastRampTime < RAMP_INTERVAL_MS) return;
     lastRampTime = millis();
     
+    // (Ramping 邏輯保持不變，因為它是核心控制邏輯)
+
+    // ------------------------------------------------------------------
     // 速度馬達 (T Motor) 邏輯
+    // ------------------------------------------------------------------
     if (targetSpeedT == 0) {
         currentSpeedT = 0; 
     } else {
@@ -401,9 +486,11 @@ void motorRampTask() {
                 currentSpeedT = -PWM_START_KICK_T;
             }
         }
+        
         if (abs(currentSpeedT) > abs(targetSpeedT)) {
              currentSpeedT = targetSpeedT;
         }
+
         if (abs(targetSpeedT - currentSpeedT) > RAMP_ACCEL_STEP_T) {
             if (targetSpeedT > currentSpeedT) {
                 currentSpeedT += RAMP_ACCEL_STEP_T;
@@ -415,7 +502,9 @@ void motorRampTask() {
         }
     }
 
+    // ------------------------------------------------------------------
     // 轉向馬達 (S Motor) 邏輯 
+    // ------------------------------------------------------------------
     if (targetSpeedS == 0) {
         currentSpeedS = 0; 
     } else {
@@ -426,9 +515,11 @@ void motorRampTask() {
                 currentSpeedS = -PWM_START_KICK_S;
             }
         }
+
         if (abs(currentSpeedS) > abs(targetSpeedS)) {
              currentSpeedS = targetSpeedS;
         }
+
         if (abs(targetSpeedS - currentSpeedS) > RAMP_ACCEL_STEP_S) {
              if (targetSpeedS > currentSpeedS) {
                 currentSpeedS += RAMP_ACCEL_STEP_S;
@@ -439,41 +530,37 @@ void motorRampTask() {
             currentSpeedS = targetSpeedS;
         }
     }
-    setMotorPwm(currentSpeedT, currentSpeedS); 
 
-    // <-- 新增: 輸出實際驅動的 PWM 值 (僅在馬達運轉時輸出，避免洗版)
-    if (currentSpeedT != 0 || currentSpeedS != 0) {
-        Serial.printf("[Ramp] Current PWM: T=%d, S=%d\n", currentSpeedT, currentSpeedS);
-    }
+    // 實際寫入 PWM
+    setMotorPwm(currentSpeedT, currentSpeedS); 
 }
 
-// --- Web Server 處理函式 ---
+// --- Web Server 處理函式 (同步版本) ---
 void handleRoot() {
+    
     String html = HTML_CONTENT; 
+    // 由於移除了 WiFiManager，Web Server 僅在 STA 模式連線成功後才會啟動。
     String ipAddress = WiFi.localIP().toString();
+    
     html.replace("%HOSTNAME%", globalHostname);
     html.replace("%IPADDRESS%", ipAddress);
+
     server.send(200, "text/html", html);
 }
 
 void handleControl() {
+    // *** 檢查參數替換為 server.hasArg ***
     if (server.hasArg("t") && server.hasArg("s")) {
+        
+        // 讀取原始搖桿輸入
         int rawT = server.arg("t").toInt();
         int rawS = server.arg("s").toInt();
+        
+        // 將目標速度分別約束在 T 和 S 的有效限制內
         targetSpeedT = constrain(rawT, -PWM_EFFECTIVE_LIMIT_T, PWM_EFFECTIVE_LIMIT_T); 
         targetSpeedS = constrain(rawS, -PWM_EFFECTIVE_LIMIT_S, PWM_EFFECTIVE_LIMIT_S);
-        // 【新增】更新控制時間戳記
-        lastControlTime = millis();
-        Serial.printf("WebControl (Target): T馬達(速度)=%d, S馬達(轉向)=%d\n", targetSpeedT, targetSpeedS);   
 
-        // 組裝您想回傳給 BLE 客戶端的字串
-        String response = "T:" + String(targetSpeedT) + ",S:" + String(targetSpeedS);    
-        // 透過特徵發送通知
-        if (pControlCharacteristic) {
-            pControlCharacteristic->setValue(response.c_str());
-            pControlCharacteristic->notify(); 
-        }
-
+        Serial.printf("WebControl (Target): T馬達(速度)=%d, S馬達(轉向)=%d\n", targetSpeedT, targetSpeedS);        
         server.send(200, "text/plain", "OK"); 
     } else {
         server.send(400, "text/plain", "Invalid arguments (Missing t or s)");
@@ -482,11 +569,18 @@ void handleControl() {
 
 void setupWebServer() {
     Serial.println("--- 啟動 Web Server (STA 模式) ---");
+
+    // 處理根目錄請求 (虛擬搖桿頁面)
     server.on("/", HTTP_GET, handleRoot);
+
+    // 處理馬達控制 API 請求
     server.on("/control", HTTP_GET, handleControl);
+
+    // 處理所有未定義的請求
     server.onNotFound([](){
         server.send(404, "text/plain", "Not Found");
     });
+
     server.begin();
     Serial.println("HTTP 伺服器已啟動於 Port 80。");
 }
@@ -494,6 +588,8 @@ void setupWebServer() {
 // --- mDNS/OTA 設定 ---
 void setupMdnsOtaSta() {
     Serial.println("--- 設定 mDNS 和 OTA (STA 模式) ---");
+
+    // 1. Setup mDNS
     if (MDNS.begin(globalHostname.c_str())) {
         Serial.printf("mDNS (STA 模式) 啟動: %s.local -> %s\n", 
             globalHostname.c_str(), WiFi.localIP().toString().c_str());
@@ -501,8 +597,10 @@ void setupMdnsOtaSta() {
         Serial.println("mDNS (STA 模式) 啟動失敗。");
     }
 
+    // 2. Setup OTA
     ArduinoOTA.setHostname(globalHostname.c_str());
     ArduinoOTA.setPassword("mysecurepassword"); 
+
     ArduinoOTA.onStart([]() { Serial.println("OTA 更新開始..."); });
     ArduinoOTA.onEnd([]() { Serial.println("\nOTA 更新完成! 正在重啟..."); });
     ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA 錯誤碼 [%u]\n", error); });
@@ -510,86 +608,81 @@ void setupMdnsOtaSta() {
         Serial.printf("進度: %u%%\r", (progress * 100) / total);
     });
     ArduinoOTA.begin();
+    
     Serial.println("-------------------------------------------------");
 }
 
-// --- 讀取 Preferences 並連線到 Wi-Fi ---
 void connectToSavedWiFi() {
-    preferences.begin("wifi-config", true); 
+    // 偵錯點 A：確認函數已進入
+    Serial.println("--- 進入 connectToSavedWiFi 函數 ---"); 
+
+    preferences.begin("wifi-config", true); // Open in read-only mode
+    
+    // 偵錯點 B：確認 preferences.begin 成功
+    Serial.println("NVS: preferences.begin() 執行完畢。"); 
+
     String saved_ssid = preferences.getString("ssid", "");
     String saved_pass = preferences.getString("pass", "");
     preferences.end();
     
+    // 偵錯點 C：確認 preferences.end 成功
+    Serial.println("NVS: 憑證讀取完畢。"); 
+
+    // ... (後續邏輯不變)
     if (saved_ssid.length() == 0) {
         Serial.println("無儲存的 Wi-Fi 憑證。裝置保持 BLE 廣告，等待配置...");
         return; 
     }
     
+    // ... (嘗試連線邏輯不變)
+}
+/*
+// --- 【替換函數】讀取 Preferences 並連線到 Wi-Fi ---
+void connectToSavedWiFi() {
+
+    preferences.begin("wifi-config", true); // Open in read-only mode
+    String saved_ssid = preferences.getString("ssid", "");
+    String saved_pass = preferences.getString("pass", "");
+    preferences.end();
+    
+    // 檢查是否有儲存的憑證
+    if (saved_ssid.length() == 0) {
+        Serial.println("無儲存的 Wi-Fi 憑證。裝置保持 BLE 廣告，等待配置...");
+        // 保持在空閒狀態，只運行 BLE 任務和 loop() 中的 motorRampTask()
+        return; 
+    }
+    
+    // 嘗試連線
     Serial.printf("嘗試連線到儲存的 Wi-Fi: %s\n", saved_ssid.c_str());
     WiFi.setHostname(globalHostname.c_str());
-    WiFi.mode(WIFI_STA); 
     WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
+    
+    // 設置 Wi-Fi 模式為 STA
+    WiFi.mode(WIFI_STA); 
+    
+    // 避免長時間阻塞，連線狀態會在 loop() 中的 checkAndStartServices() 檢查
 }
+*/
+bool servicesStarted = false;
 
-// --- BLE 連線狀態回調 ---
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-        vTaskDelay(pdMS_TO_TICKS(1)); 
-        Serial.println("✅ BLE Client Connected.");
-    }
-    void onDisconnect(BLEServer* pServer) {
-        Serial.println("❌ BLE Client Disconnected. Setting flag to restart...");
-        should_restart_advertising = true; 
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-};
+void checkAndStartServices() {
+    // 只有在連線成功且服務尚未啟動時才執行
+    if (WiFi.status() == WL_CONNECTED && !servicesStarted) {
+        Serial.println("✅ Wi-Fi 連線成功，啟動服務...");
+        
+        // 2. Setup mDNS and OTA (STA Mode)
+        setupMdnsOtaSta();
 
-// --- BLE 特徵寫入回調 ---
-class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* pCharacteristic) {
-        std::string rxValue = pCharacteristic->getValue();
-        if (rxValue.length() > 0) {
-            String command = String(rxValue.c_str());
-            Serial.printf("[BLE CMD] Received RAW: %s\n", command.c_str()); // <-- 新增: 顯示收到的原始字串
-            
-            int commaIndex = command.indexOf(',');
-            if (commaIndex > 0) {
-                int rawT = command.substring(0, commaIndex).toInt();
-                int rawS = command.substring(commaIndex + 1).toInt();
-                
-                // 設定目標速度，並進行約束 (Constrain)
-                targetSpeedT = constrain(rawT, -PWM_EFFECTIVE_LIMIT_T, PWM_EFFECTIVE_LIMIT_T); 
-                targetSpeedS = constrain(rawS, -PWM_EFFECTIVE_LIMIT_S, PWM_EFFECTIVE_LIMIT_S);
-                // 【新增】更新控制時間戳記
-                lastControlTime = millis(); 
-                Serial.printf("  -> Target Set: T=%d, S=%d\n", targetSpeedT, targetSpeedS);
-            }
-        }
-    }
-};
+        // 3. Setup Web Server (STA Mode)
+        setupWebServer();
+        
+        servicesStarted = true;
 
-// --- BLE 配置回調 (接收 Wi-Fi 憑證) ---
-class ConfigCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* pCharacteristic) {
-        std::string rxValue = pCharacteristic->getValue();
-        if (rxValue.length() > 0) {
-            String data = String(rxValue.c_str());
-            
-            if (pCharacteristic == pSsidCharacteristic) {
-                ble_ssid = data;
-                Serial.printf("[BLE Config] Received SSID: %s\n", ble_ssid.c_str());
-            } else if (pCharacteristic == pPassCharacteristic) {
-                ble_pass = data;
-                Serial.println("[BLE Config] Received Password.");
-                
-                if (ble_ssid.length() > 0) {
-                    wifi_config_received = true; 
-                    Serial.println("BLE 配置完成，準備儲存 Wi-Fi 憑證...");
-                }
-            }
-        }
+        Serial.println("-------------------------------------------------------");
+        Serial.printf("裝置已啟動: %s.local\n", globalHostname.c_str()); 
+        Serial.println("-------------------------------------------------------");
     }
-};
+}
 
 // --- BLE 配置處理迴圈 (在收到憑證後重啟) ---
 void handleBleConfigLoop() {
@@ -601,58 +694,73 @@ void handleBleConfigLoop() {
         preferences.end();
         wifi_config_received = false;
         
+        // 延遲以確保 Serial 輸出完成
         delay(100); 
         ESP.restart();
     }
 }
 
-// --- 【BLE 核心修改】 setupBleServer_Bluedroid ---
-void setupBleServer_Bluedroid() {
-    BLEDevice::init(globalHostname.c_str());
-    BLEDevice::setPower(ESP_PWR_LVL_P9);
-
-    pServer = BLEDevice::createServer();
+// 替換您現有的 setupBLE() 函數
+void setupBleServer() {
+    // 0. 初始化 BLE 設備 (只需執行一次)
+    NimBLEDevice::init(globalHostname.c_str());
+    // 建議將功率設置為 MAX (ESP_PWR_LVL_P9) 以優化連線穩定性
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9); 
+    
+    pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
     // 1. 馬達控制服務 (使用動態 UUID)
-    BLEService *pControlService = pServer->createService(controlServiceUUID.c_str());
+    NimBLEService *pControlService = pServer->createService(controlServiceUUID.c_str());
     pControlCharacteristic = pControlService->createCharacteristic(
         CONTROL_CHAR_UUID, 
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
     );
-    pControlCharacteristic->addDescriptor(new BLE2902());
     pControlCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+    pControlService->start();
 
     // 2. Wi-Fi 配置服務 (使用動態 UUID)
-    BLEService *pConfigService = pServer->createService(configServiceUUID.c_str());
+    NimBLEService *pConfigService = pServer->createService(configServiceUUID.c_str());
     
+    // SSID 特徵 (寫入)
     pSsidCharacteristic = pConfigService->createCharacteristic(
         SSID_CHAR_UUID, 
-        BLECharacteristic::PROPERTY_WRITE
+        NIMBLE_PROPERTY::WRITE
     );
     pSsidCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
 
+    // Password 特徵 (寫入)
     pPassCharacteristic = pConfigService->createCharacteristic(
         PASS_CHAR_UUID, 
-        BLECharacteristic::PROPERTY_WRITE
+        NIMBLE_PROPERTY::WRITE
     );
     pPassCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
     
-    // 啟動服務 (必須在創建完所有特徵後呼叫)
     pConfigService->start();
-    pControlService->start(); 
 
-    // 3. 啟動廣告 (使用 Bluedroid)
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(configServiceUUID.c_str()); 
+    // 3. 啟動廣告
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->setName(globalHostname.c_str());
+    
+    // 加入兩個服務的 UUID 到廣告封包中
     pAdvertising->addServiceUUID(controlServiceUUID.c_str());
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06); 
+    pAdvertising->addServiceUUID(configServiceUUID.c_str()); 
+
+    // 啟動廣告
     pAdvertising->start(); 
 
-    Serial.println("✅ BLE Advertising Started (Bluedroid).");
+    Serial.println("✅ BLE Advertising Started.");
 }
 
+void bleTask(void *p) {
+
+    setupBleServer();
+
+    while (true)
+    {
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
 
 // --- Setup ---
 void setup() {
@@ -660,82 +768,64 @@ void setup() {
     delay(1000);
 
     // --- 初始化馬達控制腳位 (DRV8833) ---
-    // 註：請確保 esp32c3_gpio.h 中定義了 NSLEEP_PIN, AIN1_PIN, AIN2_PIN, BIN1_PIN, BIN2_PIN
     pinMode(NSLEEP_PIN, OUTPUT);
     digitalWrite(NSLEEP_PIN, HIGH); 
     Serial.printf("馬達驅動 (nSLEEP) 已致能於 GPIO%d\n", NSLEEP_PIN);
 
-    // PWM 設定和連接
+    // PWM 設定
     ledcSetup(LEDC_CH_A1, PWM_FREQ, PWM_RESOLUTION);
     ledcSetup(LEDC_CH_A2, PWM_FREQ, PWM_RESOLUTION);
     ledcSetup(LEDC_CH_B1, PWM_FREQ, PWM_RESOLUTION);
     ledcSetup(LEDC_CH_B2, PWM_FREQ, PWM_RESOLUTION);
 
+    // PWM 腳位連接
     ledcAttachPin(AIN1_PIN, LEDC_CH_A1);
     ledcAttachPin(AIN2_PIN, LEDC_CH_A2);
     ledcAttachPin(BIN1_PIN, LEDC_CH_B1);
     ledcAttachPin(BIN2_PIN, LEDC_CH_B2);
 
-    setMotorPwm(0, 0); 
+    setMotorPwm(0, 0); // 確保馬達啟動時靜止
     
     // 0. 產生唯一的 Hostname
     generateHostname();
     generateUniqueUuids();
 
-    // --- 【BLE 核心修改】直接在 setup() 中啟動 Bluedroid ---
-    setupBleServer_Bluedroid();
+    // --- 啟動 BLE 任務 (最高優先級以確保穩定性) ---
+    xTaskCreate(
+        bleTask,          // 任務函數
+        "BLE_Task",       // 任務名稱
+        8192,             // 堆疊大小 
+        NULL,             // 傳遞給任務的參數
+        1,                // 任務優先級
+        NULL              // 任務句柄
+    );
 
-    // 1. 嘗試連線 Wi-Fi
+    delay(50); 
+    Serial.println("--- 延遲 50ms 確保 BLE 穩定 ---");
+    // --- 啟動器核心邏輯 ---
+    // 1. 嘗試連線 Wi-Fi (取代 WiFiManager 的 autoConnect)
     connectToSavedWiFi();
 }
 
 // --- Loop ---
-void loop() {    
-    // 1. 超時安全停止檢查
-    if (targetSpeedT != 0 || targetSpeedS != 0) {
-        if (millis() - lastControlTime > CONTROL_TIMEOUT_MS) {
-            Serial.println("🚨 控制超時! 強制設定目標速度為零。");
-            targetSpeedT = 0;
-            targetSpeedS = 0;
-            
-            // 可選：發送通知給 BLE 客戶端，告知已停止
-            if (pControlCharacteristic) {
-                pControlCharacteristic->setValue("TIMEOUT:0,0");
-                pControlCharacteristic->notify(); 
-            }
-        }
-    }
-    // 2. 處理延遲的廣告重啟請求
-    if (should_restart_advertising) {
-        Serial.print("Loop: Executing delayed advertising restart... ");
-        pServer->startAdvertising(); 
-        Serial.println("✅ SUCCESS");
-        should_restart_advertising = false;
-    }
+void loop() {
+    
+    // 【已移除】 wm.process(); 
 
-    // 3. 檢查連線狀態，並啟動後續服務 (只執行一次)
-    if (WiFi.status() == WL_CONNECTED && !servicesStarted) {
-        Serial.println("✅ Wi-Fi 連線成功，啟動服務...");
-        setupMdnsOtaSta();
-        setupWebServer();
-        servicesStarted = true;
-        Serial.println("-------------------------------------------------------");
-        Serial.printf("裝置已啟動: %s.local\n", globalHostname.c_str()); 
-        Serial.println("-------------------------------------------------------");
-    }
+    // 2. 檢查連線狀態，並啟動後續服務 (只執行一次)
+    checkAndStartServices();
 
-    // 4. Web Server 和 OTA 僅在服務啟動後才處理
+    // 3. Web Server 和 OTA 僅在服務啟動 (即 STA 連線成功) 後才處理
     if (servicesStarted) {
         server.handleClient();
         ArduinoOTA.handle();
     }
     
-    // 5. 處理 BLE 接收到的 Wi-Fi 配置並重啟
+    // 4. 處理 BLE 接收到的 Wi-Fi 配置並重啟
     handleBleConfigLoop();
     
-    // 6. 馬達 Ramping 邏輯
+    // 5. 馬達 Ramping 邏輯
     motorRampTask();
     
-    // 保持 loop() 有機會切換任務
-    delay(1); 
+    yield();
 }
