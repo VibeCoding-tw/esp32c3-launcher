@@ -382,6 +382,101 @@ void saveMotorConfig() {
     Serial.println("✅ 馬達參數已儲存到 NVS。");
 }
 
+// --- 修正後的馬達 Ramping 任務 ---
+// 額外定義一個變數追蹤 S 馬達持續輸出的時間
+unsigned long sMotorStartTime = 0;
+const unsigned long S_MOTOR_MAX_ON_TIME = 800; // 轉向馬達單次連續輸出上限 (ms)
+
+void motorRampTask() {
+    if (millis() - lastRampTime < RAMP_INTERVAL_MS) return;
+    lastRampTime = millis();
+    
+    // --- 1. 速度馬達 (T Motor) 邏輯 ---
+    if (targetSpeedT == 0) {
+        // 速度馬達通常允許慣性滑行或較快減速
+        currentSpeedT = 0; 
+    } else {
+        if (currentSpeedT == 0) {
+            currentSpeedT = (targetSpeedT > 0) ? motorConfig.pwmStartKickT : -motorConfig.pwmStartKickT;
+        }
+        
+        int diffT = targetSpeedT - currentSpeedT;
+        if (abs(diffT) <= motorConfig.rampAccelStepT) {
+            currentSpeedT = targetSpeedT;
+        } else {
+            currentSpeedT += (diffT > 0) ? motorConfig.rampAccelStepT : -motorConfig.rampAccelStepT;
+        }
+    }
+
+    // --- 2. 轉向馬達 (S Motor) 邏輯優化 ---
+    if (targetSpeedS == 0) {
+        currentSpeedS = 0;
+        sMotorStartTime = 0; // 重置計時器
+    } else {
+        // 紀錄開始轉向的時間點，用以實作「超時降壓」保護邏輯
+        if (sMotorStartTime == 0) sMotorStartTime = millis();
+
+        // 啟動 Kickstart
+        if (currentSpeedS == 0) {
+            currentSpeedS = (targetSpeedS > 0) ? motorConfig.pwmStartKickS : -motorConfig.pwmStartKickS;
+        }
+
+        // 轉向 Ramping: 對於兩線式馬達，轉向通常需要比速度更快的響應
+        int diffS = targetSpeedS - currentSpeedS;
+        if (abs(diffS) <= motorConfig.rampAccelStepS) {
+            currentSpeedS = targetSpeedS;
+        } else {
+            currentSpeedS += (diffS > 0) ? motorConfig.rampAccelStepS : -motorConfig.rampAccelStepS;
+        }
+
+        // 【安全保護】如果轉向馬達輸出時間過長，可能是打死了，強制降低輸出以防燒毀
+        if (millis() - sMotorStartTime > S_MOTOR_MAX_ON_TIME) {
+            // 將輸出限制在 60% (維持轉向力矩但減少發熱)
+            currentSpeedS = constrain(currentSpeedS, -150, 150); 
+        }
+    }
+
+    // 最終約束
+    currentSpeedT = constrain(currentSpeedT, -motorConfig.pwmEffectiveLimitT, motorConfig.pwmEffectiveLimitT);
+    currentSpeedS = constrain(currentSpeedS, -motorConfig.pwmEffectiveLimitS, motorConfig.pwmEffectiveLimitS);
+    
+    setMotorPwm(currentSpeedT, currentSpeedS); 
+
+    // 僅在有動作時輸出 Serial
+    static int pLastT, pLastS;
+    if (currentSpeedT != pLastT || currentSpeedS != pLastS) {
+        if (currentSpeedT != 0 || currentSpeedS != 0) {
+            Serial.printf("[Ramp] T:%d | S:%d\n", currentSpeedT, currentSpeedS);
+        }
+        pLastT = currentSpeedT; pLastS = currentSpeedS;
+    }
+}
+
+// --- 修正後的 PWM 寫入 (增加 H 橋安全) ---
+void setMotorPwm(int speedT, int speedS) {
+    // T 馬達防直通處理
+    if (speedT > 0) { 
+        ledcWrite(LEDC_CH_A2, 0); // 確保另一端先關閉
+        ledcWrite(LEDC_CH_A1, speedT);
+    } else if (speedT < 0) { 
+        ledcWrite(LEDC_CH_A1, 0);
+        ledcWrite(LEDC_CH_A2, -speedT); 
+    } else { 
+        ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, 0);
+    }
+
+    // S 馬達防直通處理
+    if (speedS > 0) { 
+        ledcWrite(LEDC_CH_B1, 0);
+        ledcWrite(LEDC_CH_B2, speedS);
+    } else if (speedS < 0) { 
+        ledcWrite(LEDC_CH_B2, 0);
+        ledcWrite(LEDC_CH_B1, -speedS); 
+    } else { 
+        ledcWrite(LEDC_CH_B1, 0); ledcWrite(LEDC_CH_B2, 0);
+    }
+}
+/*
 // --- 輔助函數: 實際寫入 PWM 值 ---
 void setMotorPwm(int speedT, int speedS) {
     // T 馬達 (速度)
@@ -467,13 +562,14 @@ void motorRampTask() {
             currentSpeedS = targetSpeedS;
         }
     }
+    
     setMotorPwm(currentSpeedT, currentSpeedS); 
 
     if (currentSpeedT != 0 || currentSpeedS != 0) {
         Serial.printf("[Ramp] Current PWM: T=%d, S=%d\n", currentSpeedT, currentSpeedS);
     }
 }
-
+*/
 // --- Web Server 處理函式 ---
 void handleRoot() {
     String html = HTML_CONTENT; 
