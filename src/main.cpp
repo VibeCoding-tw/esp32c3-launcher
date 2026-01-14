@@ -382,6 +382,31 @@ void saveMotorConfig() {
     Serial.println("✅ 馬達參數已儲存到 NVS。");
 }
 
+// --- 修正後的 PWM 寫入 (增加 H 橋安全) ---
+void setMotorPwm(int speedT, int speedS) {
+    // T 馬達防直通處理
+    if (speedT > 0) { 
+        ledcWrite(LEDC_CH_A2, 0); // 確保另一端先關閉
+        ledcWrite(LEDC_CH_A1, speedT);
+    } else if (speedT < 0) { 
+        ledcWrite(LEDC_CH_A1, 0);
+        ledcWrite(LEDC_CH_A2, -speedT); 
+    } else { 
+        ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, 0);
+    }
+
+    // S 馬達防直通處理
+    if (speedS > 0) { 
+        ledcWrite(LEDC_CH_B1, 0);
+        ledcWrite(LEDC_CH_B2, speedS);
+    } else if (speedS < 0) { 
+        ledcWrite(LEDC_CH_B2, 0);
+        ledcWrite(LEDC_CH_B1, -speedS); 
+    } else { 
+        ledcWrite(LEDC_CH_B1, 0); ledcWrite(LEDC_CH_B2, 0);
+    }
+}
+
 // --- 修正後的馬達 Ramping 任務 ---
 // 額外定義一個變數追蹤 S 馬達持續輸出的時間
 unsigned long sMotorStartTime = 0;
@@ -452,30 +477,6 @@ void motorRampTask() {
     }
 }
 
-// --- 修正後的 PWM 寫入 (增加 H 橋安全) ---
-void setMotorPwm(int speedT, int speedS) {
-    // T 馬達防直通處理
-    if (speedT > 0) { 
-        ledcWrite(LEDC_CH_A2, 0); // 確保另一端先關閉
-        ledcWrite(LEDC_CH_A1, speedT);
-    } else if (speedT < 0) { 
-        ledcWrite(LEDC_CH_A1, 0);
-        ledcWrite(LEDC_CH_A2, -speedT); 
-    } else { 
-        ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, 0);
-    }
-
-    // S 馬達防直通處理
-    if (speedS > 0) { 
-        ledcWrite(LEDC_CH_B1, 0);
-        ledcWrite(LEDC_CH_B2, speedS);
-    } else if (speedS < 0) { 
-        ledcWrite(LEDC_CH_B2, 0);
-        ledcWrite(LEDC_CH_B1, -speedS); 
-    } else { 
-        ledcWrite(LEDC_CH_B1, 0); ledcWrite(LEDC_CH_B2, 0);
-    }
-}
 /*
 // --- 輔助函數: 實際寫入 PWM 值 ---
 void setMotorPwm(int speedT, int speedS) {
