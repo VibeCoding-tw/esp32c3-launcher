@@ -75,6 +75,11 @@ String ble_pass;
 bool wifi_config_received = false;
 volatile bool should_restart_advertising = false;
 bool servicesStarted = false;
+float batteryVoltage = 0.0;          // 電池電壓 ( filtered )
+const float ADC_VOLT_REF = 3.1;      // ESP32-C3 ADC 參考電壓 ( 依實際情況微調 )
+const float DIVIDER_RATIO = 2.0;     // 分壓比例 ( 100k+100k )
+unsigned long lastBatteryCheck = 0;
+const int BATT_CHECK_INTERVAL = 500; // 每 500ms 檢查一次
 
 // --- HTML 網頁內容 ---
 const char* HTML_CONTENT = R"rawliteral(
@@ -143,10 +148,21 @@ const char* HTML_CONTENT = R"rawliteral(
 <body class="p-4">
     <div class="container bg-gray-800 rounded-xl shadow-2xl">
         <h1 class="text-3xl font-extrabold text-center text-indigo-400 mb-2">Vibe Racer</h1>
-        <p class="text-center text-sm mb-6 text-gray-400">
-            裝置名稱: <span id="hostname">%HOSTNAME%</span><br>
-            IP: <span id="ipaddress">%IPADDRESS%</span>
+        <p class="text-center text-sm mb-4 text-gray-400">
+            裝置: <span id="hostname">%HOSTNAME%</span> | <span id="ipaddress">%IPADDRESS%</span>
         </p>
+
+        <!-- 電量與診斷資訊 -->
+        <div class="flex justify-between items-center bg-gray-900/50 rounded-lg p-3 mb-6 border border-gray-700">
+            <div class="text-left">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">電池電壓</p>
+                <p class="text-xl font-mono font-bold text-green-400"><span id="val_v">0.00</span>V</p>
+            </div>
+            <div class="text-right">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">即時功率 (Ramp)</p>
+                <p class="text-sm font-mono text-indigo-300">T: <span id="val_rt">0</span> | S: <span id="val_rs">0</span></p>
+            </div>
+        </div>
 
         <div id="joystick" class="mb-6">
             <div id="joystick-inner">
@@ -154,10 +170,10 @@ const char* HTML_CONTENT = R"rawliteral(
             </div>
         </div>
 
-        <div class="text-center space-y-2">
+        <div class="text-center space-y-2 pb-4">
             <p class="text-xl">狀態: <span id="status" class="text-green-400">靜止</span></p>
             <p class="text-xs text-gray-500">
-                X (轉向): <span id="val_x">0</span> | Y (速度): <span id="val_y">0</span>
+                目標 X: <span id="val_x">0</span> | 目標 Y: <span id="val_y">0</span>
             </p>
         </div>
     </div>
@@ -169,85 +185,71 @@ const char* HTML_CONTENT = R"rawliteral(
         const statusEl = document.getElementById('status');
         const valXEl = document.getElementById('val_x');
         const valYEl = document.getElementById('val_y');
+        const valVEl = document.getElementById('val_v');
+        const valRTEl = document.getElementById('val_rt');
+        const valRSELEl = document.getElementById('val_rs');
         
-        // Deadzone 設定 (PWM 值，範圍 0-255)
         const DEADZONE_PWM = 20; 
-
-        // maxRadius 是實際拖曳區域 (joystick-inner) 的半徑
         const maxRadius = joystick.clientWidth / 2;
         let isDragging = false;
         let controlInterval;
-        let lastMotorT = 0; // 上次發送的 T 馬達速度
-        let lastMotorS = 0; // 上次發送的 S 馬達速度
+        let lastMotorT = 0;
+        let lastMotorS = 0;
         const baseIp = ''; 
         
-        /**
-         * @brief 根據搖桿位置 (Cartesian 座標) 計算並發送馬達速度。
-         */
         function updateMotorValues(rawX, rawY) {
-            
-            // 1. 計算幅度和角度
             const distance = Math.sqrt(rawX*rawX + rawY*rawY);
             const magnitude = Math.min(1.0, distance / maxRadius);
             const angle = Math.atan2(rawY, rawX);
             
-            // 2. 計算歸一化後的 X, Y (範圍 -1.0 到 1.0)
-            const normX = magnitude * Math.cos(angle); // 轉向 (Steering)
-            const normY = magnitude * Math.sin(angle); // 速度 (Throttle)
+            const normX = magnitude * Math.cos(angle); 
+            const normY = magnitude * Math.sin(angle); 
 
-            // 3. 轉換為 -255 到 255 的整數
             let speedT = Math.round(normY * 255);
             let speedS = Math.round(normX * 255);
 
-            // --- 4. 關鍵：在 Web 端實作 Deadzone 邏輯 ---
-            if (Math.abs(speedT) < DEADZONE_PWM) {
-                speedT = 0;
-            }
-            if (Math.abs(speedS) < DEADZONE_PWM) {
-                speedS = 0;
-            }
-            // ----------------------------------------------------
+            if (Math.abs(speedT) < DEADZONE_PWM) speedT = 0;
+            if (Math.abs(speedS) < DEADZONE_PWM) speedS = 0;
 
-            // 更新顯示
-            valYEl.textContent = speedT; // 顯示 T 馬達 (速度)
-            valXEl.textContent = speedS; // 顯示 S 馬達 (轉向)
+            valYEl.textContent = speedT;
+            valXEl.textContent = speedS;
             
-            // 更新狀態文字和顏色
             let currentStatus = "靜止";
             let statusColor = "text-green-400";
             if (Math.abs(speedT) > 0 || Math.abs(speedS) > 0) {
                  statusColor = "text-yellow-400";
-                 if (speedT > 50 && Math.abs(speedS) < 50) currentStatus = "前進加速中";
-                 else if (speedT < -50 && Math.abs(speedS) < 50) currentStatus = "後退減速中";
+                 if (speedT > 50 && Math.abs(speedS) < 50) currentStatus = "前進中";
+                 else if (speedT < -50 && Math.abs(speedS) < 50) currentStatus = "後退中";
                  else if (speedS > 50) currentStatus = "右轉中";
                  else if (speedS < -50) currentStatus = "左轉中";
                  else currentStatus = "移動中";
-            } else {
-                 statusColor = "text-green-400";
             }
             statusEl.textContent = currentStatus;
-            statusEl.className = statusColor;
+            statusEl.className = statusEl.className.replace(/text-\w+-\d+/, statusColor);
 
-            // 如果數值有變化，發送控制請求
             if (speedT !== lastMotorT || speedS !== lastMotorS) {
                 lastMotorT = speedT;
                 lastMotorS = speedS;
-                // 發送 T 馬達速度 (t) 和 S 馬達速度 (s)
                 sendControl(speedT, speedS); 
             }
         }
 
         function sendControl(T, S) {
-            // 使用非同步請求發送馬達速度
-            fetch(`${baseIp}/control?t=${T}&s=${S}`, { method: 'GET' })
-                .then(response => {
-                    if (!response.ok) {
-                        console.error('Server responded with an error:', response.status);
+            fetch(`${baseIp}/control?t=${T}&s=${S}`)
+                .then(response => response.json())
+                .then(data => {
+                    // 更新電壓與即時 Ramp 數值
+                    if (data.v !== undefined) {
+                        valVEl.textContent = data.v.toFixed(2);
+                        // 低電壓警示 (假設 1S 鋰電池 3.4V)
+                        if (data.v < 3.4) valVEl.className = "text-red-500";
+                        else if (data.v < 3.6) valVEl.className = "text-yellow-400";
+                        else valVEl.className = "text-green-400";
                     }
+                    if (data.rt !== undefined) valRTEl.textContent = data.rt;
+                    if (data.rs !== undefined) valRSELEl.textContent = data.rs;
                 })
-                .catch(error => {
-                    // console.error('Control command failed:', error);
-                });
+                .catch(err => console.error('Fetch error:', err));
         }
 
         function resetThumbPosition() {
@@ -380,6 +382,20 @@ void saveMotorConfig() {
     preferences.putBytes("config", &motorConfig, sizeof(MotorConfig_t));
     preferences.end();
     Serial.println("✅ 馬達參數已儲存到 NVS。");
+}
+
+// --- 電壓採樣與濾波 ---
+void updateBatteryVoltage() {
+    if (millis() - lastBatteryCheck < BATT_CHECK_INTERVAL) return;
+    lastBatteryCheck = millis();
+
+    int rawAdc = analogRead(BATT_ADC_PIN);
+    // 將 ADC 轉換為電壓 ( C3 的 ADC 範圍約 0-3.3V, 12-bit )
+    float sensedVolt = (rawAdc / 4095.0) * ADC_VOLT_REF * DIVIDER_RATIO;
+
+    // 指數移動平均濾波 ( Expo Smoothing )
+    if (batteryVoltage < 0.1) batteryVoltage = sensedVolt; // 第一次讀取初始化
+    else batteryVoltage = (batteryVoltage * 0.9) + (sensedVolt * 0.1);
 }
 
 // --- 修正後的 PWM 寫入 (增加 H 橋安全) ---
@@ -585,23 +601,30 @@ void handleControl() {
         int rawT = server.arg("t").toInt();
         int rawS = server.arg("s").toInt();
         
-        // 使用 Limit 參數進行約束
         targetSpeedT = constrain(rawT, -motorConfig.pwmEffectiveLimitT, motorConfig.pwmEffectiveLimitT); 
         targetSpeedS = constrain(rawS, -motorConfig.pwmEffectiveLimitS, motorConfig.pwmEffectiveLimitS);
         
         lastControlTime = millis();
-        Serial.printf("WebControl (Target): T馬達(速度)=%d, S馬達(轉向)=%d\n", targetSpeedT, targetSpeedS);   
 
-        String response = "T:" + String(targetSpeedT) + ",S:" + String(targetSpeedS);    
-        
+        // 構造 JSON 回應 (包含電壓與即時 Ramp 速度)
+        String json = "{";
+        json += "\"t\":" + String(targetSpeedT) + ",";
+        json += "\"s\":" + String(targetSpeedS) + ",";
+        json += "\"rt\":" + String(currentSpeedT) + ","; // Real-time Throttle
+        json += "\"rs\":" + String(currentSpeedS) + ","; // Real-time Steering
+        json += "\"v\":" + String(batteryVoltage, 2) + ",";
+        json += "\"to\":" + String((millis() - lastControlTime > motorConfig.controlTimeoutMs) ? 1 : 0);
+        json += "}";
+
         if (pControlCharacteristic) {
+            String response = "T:" + String(targetSpeedT) + ",S:" + String(targetSpeedS);    
             pControlCharacteristic->setValue(response.c_str());
             pControlCharacteristic->notify(); 
         }
 
-        server.send(200, "text/plain", "OK"); 
+        server.send(200, "application/json", json); 
     } else {
-        server.send(400, "text/plain", "Invalid arguments (Missing t or s)");
+        server.send(400, "text/plain", "Invalid arguments");
     }
 }
 
@@ -879,6 +902,10 @@ void setup() {
 
     setMotorPwm(0, 0); 
     
+    // 初始化 ADC
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db); // 0 - 3.1V 範圍
+    
     // 0. 產生唯一的 Hostname
     generateHostname();
     
@@ -934,6 +961,9 @@ void loop() {
     
     // 6. 馬達 Ramping 邏輯
     motorRampTask();
+
+    // 7. 電壓採樣
+    updateBatteryVoltage();
     
     // 保持 loop() 有機會切換任務
     delay(1); 
