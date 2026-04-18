@@ -26,6 +26,7 @@ Vibe Racer 是一個專為高品質遙控車設計的嵌入式控制系統。基
 *   **維護與更新**：
     *   **ArduinoOTA**：支援無線韌體升級。
     *   **mDNS**：可透過自定義域名（如 `esp32c3-xxxxxx.local`）直接訪問，無需記憶 IP。
+*   **硬體強制恢復原廠 (Factory Reset)**：(New ✨) 於啟動時將 **GPIO 1** 接地，可強制跳過 OTA 更新數據並返回 Factory 分區啟動。
 
 ---
 
@@ -41,6 +42,7 @@ Vibe Racer 是一個專為高品質遙控車設計的嵌入式控制系統。基
 | **BIN2_PIN** | 7 | 馬達 S (Steering) 輸入 2 |
 | **NSLEEP** | 4 | 馬達驅動器致能 (High Active) |
 | **BATT_ADC** | 5 | 電池分壓電壓採樣 (ADC1_CH5) |
+| **FACTORY_RST** | 1 | 恢復原廠設定按鈕 (地面觸發) |
 
 ### 指示燈與狀態
 - **Serial**: 波特率定為 `115200`，輸出即時 Ramp 狀態與系統診斷資訊。
