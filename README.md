@@ -62,8 +62,10 @@ Vibe Racer 是一個專為高品質遙控車設計的嵌入式控制系統。基
     - 配置服務: `6e400001-b5a3-f393-e0a9-e50e24dcca9e` (SSID/Password 寫入)
     - 控制服務: `4fafc201-1fb5-459e-8fcc-c0ffee00dead` (馬達控制與參數配置)
 - **特徵點 (Characteristic)**:
-    - 實時控制: `4fafc202-...` (寫入 `T,S` 字串)
-    - 參數配置: `4fafc203-...` (結構體二進位讀寫)
+    - 實時控制: `4fafc202-1fb5-459e-8fcc-c0ffee01feed` (寫入 `T,S` 字串)
+    - 參數配置: `4fafc203-1fb5-459e-8fcc-c0ffee02dead` (結構體二進位讀寫)
+    - Wi-Fi SSID: `6e400002-b5a3-f393-e0a9-e50e24dcca9e` (寫入)
+    - Wi-Fi PASS: `6e400003-b5a3-f393-e0a9-e50e24dcca9e` (寫入)
 
 ---
 
