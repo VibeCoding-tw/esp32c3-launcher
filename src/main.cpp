@@ -341,7 +341,7 @@ const char* HTML_CONTENT = R"rawliteral(
         stopMotors(); 
     </script>
 </body>
-</html>
+</html>)rawliteral";
 // --- 自定義 Factory OTA 更新處理 ---
 void handleFactoryUpdate() {
     server.send(200, "text/html", 
@@ -490,9 +490,7 @@ void handleGitHubUpdate() {
     performGitHubCloudUpdate();
 }
 
-)rawliteral";
-
-// 產生基於 MAC 位址的 Hostname (保持不變)
+// --- 產生 Hostname ---
 void generateHostname() {    
     globalHostname = "esp32c3-" + WiFi.macAddress(); 
     globalHostname.replace(":", ""); 
