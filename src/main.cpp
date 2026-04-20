@@ -32,7 +32,8 @@ const int LEDC_CH_B2 = 3;
 
 // --- 馬達 Ramping 參數結構體 (與需求一致) ---
 typedef struct {
-    unsigned long controlTimeoutMs; 
+    uint16_t controlTimeoutT; // 補償：加速馬達超時 (ms)
+    uint16_t controlTimeoutS; // 補償：轉向馬達超時 (ms)
     int pwmEffectiveLimitT; 
     int rampAccelStepT; 
     int pwmStartKickT; 
@@ -350,13 +351,14 @@ void generateHostname() {
 void loadMotorConfig() {
     // 預設值 (如果 NVS 中沒有)
     MotorConfig_t defaultConfig = {
-        .controlTimeoutMs = 500, 
-        .pwmEffectiveLimitT = 255, 
-        .rampAccelStepT = 10, 
-        .pwmStartKickT = 200, 
-        .pwmEffectiveLimitS = 255, 
-        .rampAccelStepS = 10, 
-        .pwmStartKickS = 200
+        .controlTimeoutT = 500, 
+        .controlTimeoutS = 2000, 
+        .pwmEffectiveLimitT = 200, 
+        .rampAccelStepT = 3, 
+        .pwmStartKickT = 60, 
+        .pwmEffectiveLimitS = 200, 
+        .rampAccelStepS = 5, 
+        .pwmStartKickS = 80
     };
 
     preferences.begin("motor-config", true);
@@ -371,7 +373,7 @@ void loadMotorConfig() {
     }
     
     // 輸出當前配置
-    Serial.printf("  Timeout: %lu ms\n", motorConfig.controlTimeoutMs);
+    Serial.printf("  Timeout T: %u ms, S: %u ms\n", motorConfig.controlTimeoutT, motorConfig.controlTimeoutS);
     Serial.printf("  T Limit: %d, T Step: %d, T Kick: %d\n", motorConfig.pwmEffectiveLimitT, motorConfig.rampAccelStepT, motorConfig.pwmStartKickT);
     Serial.printf("  S Limit: %d, S Step: %d, S Kick: %d\n", motorConfig.pwmEffectiveLimitS, motorConfig.rampAccelStepS, motorConfig.pwmStartKickS);
 }
@@ -438,7 +440,10 @@ void motorRampTask() {
         currentSpeedT = 0; 
     } else {
         if (currentSpeedT == 0) {
-            currentSpeedT = (targetSpeedT > 0) ? motorConfig.pwmStartKickT : -motorConfig.pwmStartKickT;
+            // 優化：Kickstart 最小也必須等於目標，或取 Kickstart 值但不得過衝
+            int kick = (targetSpeedT > 0) ? motorConfig.pwmStartKickT : -motorConfig.pwmStartKickT;
+            if (abs(kick) > abs(targetSpeedT)) currentSpeedT = targetSpeedT;
+            else currentSpeedT = kick;
         }
         
         int diffT = targetSpeedT - currentSpeedT;
@@ -459,7 +464,10 @@ void motorRampTask() {
 
         // 啟動 Kickstart
         if (currentSpeedS == 0) {
-            currentSpeedS = (targetSpeedS > 0) ? motorConfig.pwmStartKickS : -motorConfig.pwmStartKickS;
+            // 優化：Kickstart 不應超過目標速度，減少小角度轉向時的抖動
+            int kick = (targetSpeedS > 0) ? motorConfig.pwmStartKickS : -motorConfig.pwmStartKickS;
+            if (abs(kick) > abs(targetSpeedS)) currentSpeedS = targetSpeedS;
+            else currentSpeedS = kick;
         }
 
         // 轉向 Ramping: 對於兩線式馬達，轉向通常需要比速度更快的響應
@@ -519,7 +527,10 @@ void handleControl() {
         json += "\"rt\":" + String(currentSpeedT) + ","; // Real-time Throttle
         json += "\"rs\":" + String(currentSpeedS) + ","; // Real-time Steering
         json += "\"v\":" + String(batteryVoltage, 2) + ",";
-        json += "\"to\":" + String((millis() - lastControlTime > motorConfig.controlTimeoutMs) ? 1 : 0);
+        bool isTimeoutT = (millis() - lastControlTime > motorConfig.controlTimeoutT);
+        bool isTimeoutS = (millis() - lastControlTime > motorConfig.controlTimeoutS);
+        json += "\"to\":" + String(isTimeoutT ? 1 : 0) + ",";
+        json += "\"tos\":" + String(isTimeoutS ? 1 : 0);
         json += "}";
 
         if (pControlCharacteristic) {
@@ -539,7 +550,8 @@ void handleMotorConfig() {
     if (server.method() == HTTP_GET) {
         // GET: 回傳當前配置 (JSON 格式)
         String json = "{\n";
-        json += "  \"controlTimeoutMs\": " + String(motorConfig.controlTimeoutMs) + ",\n";
+        json += "  \"timeoutT\": " + String(motorConfig.controlTimeoutT) + ",\n";
+        json += "  \"timeoutS\": " + String(motorConfig.controlTimeoutS) + ",\n";
         json += "  \"pwmEffectiveLimitT\": " + String(motorConfig.pwmEffectiveLimitT) + ",\n";
         json += "  \"rampAccelStepT\": " + String(motorConfig.rampAccelStepT) + ",\n";
         json += "  \"pwmStartKickT\": " + String(motorConfig.pwmStartKickT) + ",\n";
@@ -549,8 +561,9 @@ void handleMotorConfig() {
         json += "}";
         server.send(200, "application/json", json);
     } else if (server.method() == HTTP_POST) {
-        // POST: 接收並更新配置 (假設透過 form-urlencoded 或 JSON 傳輸)
-        if (server.hasArg("timeout")) motorConfig.controlTimeoutMs = server.arg("timeout").toInt();
+        // POST: 接收並更新配置
+        if (server.hasArg("timeoutT")) motorConfig.controlTimeoutT = server.arg("timeoutT").toInt();
+        if (server.hasArg("timeoutS")) motorConfig.controlTimeoutS = server.arg("timeoutS").toInt();
         if (server.hasArg("limitT")) motorConfig.pwmEffectiveLimitT = server.arg("limitT").toInt();
         if (server.hasArg("stepT")) motorConfig.rampAccelStepT = server.arg("stepT").toInt();
         if (server.hasArg("kickT")) motorConfig.pwmStartKickT = server.arg("kickT").toInt();
@@ -824,17 +837,25 @@ void setup() {
 
 // --- Loop ---
 void loop() {    
-    // 1. 超時安全停止檢查 (使用 Timeout 參數)
+    // 1. 超時安全停止檢查 (分別針對 T 與 S)
     if (targetSpeedT != 0 || targetSpeedS != 0) {
-        if (millis() - lastControlTime > motorConfig.controlTimeoutMs) {
-            Serial.println("🚨 控制超時! 強制設定目標速度為零。");
+        unsigned long elapsed = millis() - lastControlTime;
+        
+        // 檢查加速馬達
+        if (targetSpeedT != 0 && elapsed > motorConfig.controlTimeoutT) {
+            Serial.printf("🚨 加速超時 (T)! 強制歸零 (%u ms)\n", motorConfig.controlTimeoutT);
             targetSpeedT = 0;
+        }
+        
+        // 檢查轉向馬達
+        if (targetSpeedS != 0 && elapsed > motorConfig.controlTimeoutS) {
+            Serial.printf("🚨 轉向超時 (S)! 強制歸零 (%u ms)\n", motorConfig.controlTimeoutS);
             targetSpeedS = 0;
-            
-            if (pControlCharacteristic) {
-                pControlCharacteristic->setValue("TIMEOUT:0,0");
-                pControlCharacteristic->notify(); 
-            }
+        }
+
+        if (targetSpeedT == 0 && targetSpeedS == 0 && pControlCharacteristic) {
+            pControlCharacteristic->setValue("TIMEOUT:0,0");
+            pControlCharacteristic->notify(); 
         }
     }
     // 2. 處理延遲的廣告重啟請求
