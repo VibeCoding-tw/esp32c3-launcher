@@ -4,4 +4,4 @@
 #define BIN1_PIN 10  // 馬達 S 輸入 1 (PWM)
 #define BIN2_PIN 7   // 馬達 S 輸入 2 (PWM)
 #define NSLEEP_PIN 4 // 高電位致能馬達驅動器
-#define BATT_ADC_PIN 5 // 電池電壓採樣腳位 (ADC1_CH5)
+#define BATT_ADC_PIN 0 // 電池電壓採樣腳位 (ADC1_CH0)
