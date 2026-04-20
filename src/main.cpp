@@ -203,16 +203,23 @@ const char* HTML_CONTENT = R"rawliteral(
         let lastMotorS = 0;
         const baseIp = ''; 
         
-        function updateMotorValues(rawX, rawY) {
-            const distance = Math.sqrt(rawX*rawX + rawY*rawY);
+        function updateMotorValues(offsetX, offsetY) {
+            const distance = Math.sqrt(offsetX * offsetX + offsetY * offsetY);
             const magnitude = Math.min(1.0, distance / maxRadius);
-            const angle = Math.atan2(rawY, rawX);
             
-            const normX = magnitude * Math.cos(angle); 
-            const normY = magnitude * Math.sin(angle); 
+            // 使用 Scaled-to-Square 映射，確保在圓形搖桿邊緣的任何角度（包括斜角）都能輸出 255
+            let rawX = offsetX / maxRadius;
+            let rawY = offsetY / maxRadius;
+            
+            let maxAxial = Math.max(Math.abs(rawX), Math.abs(rawY));
+            if (maxAxial > 0) {
+                let scale = magnitude / maxAxial;
+                rawX *= scale;
+                rawY *= scale;
+            }
 
-            let speedT = Math.round(normY * 255);
-            let speedS = Math.round(normX * 255);
+            let speedS = Math.round(rawX * 255);
+            let speedT = Math.round(rawY * 255);
 
             if (Math.abs(speedT) < DEADZONE_PWM) speedT = 0;
             if (Math.abs(speedS) < DEADZONE_PWM) speedS = 0;
@@ -508,7 +515,7 @@ void loadMotorConfig() {
         .rampAccelStepT = 3, 
         .pwmStartKickT = 60, 
         .pwmEffectiveLimitS = 255, 
-        .rampAccelStepS = 10, 
+        .rampAccelStepS = 20, // 提升轉向步長至 20
         .pwmStartKickS = 120
     };
 
@@ -579,7 +586,7 @@ void setMotorPwm(int speedT, int speedS) {
 // --- 修正後的馬達 Ramping 任務 ---
 // 額外定義一個變數追蹤 S 馬達持續輸出的時間
 unsigned long sMotorStartTime = 0;
-const unsigned long S_MOTOR_MAX_ON_TIME = 1200; // 延長保護時間，讓使用者有足夠時間維持轉向
+const unsigned long S_MOTOR_MAX_ON_TIME = 3000; // 延長至 3 秒，讓使用者能持續維持大幅度轉向
 
 void motorRampTask() {
     if (millis() - lastRampTime < RAMP_INTERVAL_MS) return;
@@ -631,8 +638,8 @@ void motorRampTask() {
 
         // 【安全保護】如果轉向馬達輸出時間過長，可能是打死了，強制降低輸出以防燒毀
         if (millis() - sMotorStartTime > S_MOTOR_MAX_ON_TIME) {
-            // 將輸出限制在 210 (維持足夠力矩對抗彈簧，但避免滿載發熱)
-            currentSpeedS = constrain(currentSpeedS, -210, 210); 
+            // 將輸出限制在 230 (維持強勁扭矩對抗彈簧，但避免長期滿載)
+            currentSpeedS = constrain(currentSpeedS, -230, 230); 
         }
     }
 
