@@ -505,11 +505,11 @@ void loadMotorConfig() {
         .controlTimeoutT = 500, 
         .controlTimeoutS = 2000, 
         .pwmEffectiveLimitT = 200, 
-        .rampAccelStepT = 3, 
         .pwmStartKickT = 60, 
-        .pwmEffectiveLimitS = 200, 
-        .rampAccelStepS = 5, 
-        .pwmStartKickS = 80
+        .rampAccelStepT = 3, 
+        .pwmEffectiveLimitS = 255, // 提升至最大出力以應對回正彈簧
+        .rampAccelStepS = 10,      // 轉向需要較快響應
+        .pwmStartKickS = 120       // 提高起步力道克服靜摩擦
     };
 
     preferences.begin("motor-config", true);
@@ -579,7 +579,7 @@ void setMotorPwm(int speedT, int speedS) {
 // --- 修正後的馬達 Ramping 任務 ---
 // 額外定義一個變數追蹤 S 馬達持續輸出的時間
 unsigned long sMotorStartTime = 0;
-const unsigned long S_MOTOR_MAX_ON_TIME = 800; // 轉向馬達單次連續輸出上限 (ms)
+const unsigned long S_MOTOR_MAX_ON_TIME = 1200; // 延長保護時間，讓使用者有足夠時間維持轉向
 
 void motorRampTask() {
     if (millis() - lastRampTime < RAMP_INTERVAL_MS) return;
@@ -631,8 +631,8 @@ void motorRampTask() {
 
         // 【安全保護】如果轉向馬達輸出時間過長，可能是打死了，強制降低輸出以防燒毀
         if (millis() - sMotorStartTime > S_MOTOR_MAX_ON_TIME) {
-            // 將輸出限制在 60% (維持轉向力矩但減少發熱)
-            currentSpeedS = constrain(currentSpeedS, -150, 150); 
+            // 將輸出限制在 210 (維持足夠力矩對抗彈簧，但避免滿載發熱)
+            currentSpeedS = constrain(currentSpeedS, -210, 210); 
         }
     }
 
