@@ -16,6 +16,8 @@
 #include <Preferences.h>             // 用於儲存 Wi-Fi 憑證及馬達參數
 #include <freertos/FreeRTOS.h>       // 繼續使用 FreeRTOS 任務功能
 #include <freertos/task.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
@@ -176,6 +178,9 @@ const char* HTML_CONTENT = R"rawliteral(
             <p class="text-xs text-gray-500">
                 目標 X: <span id="val_x">0</span> | 目標 Y: <span id="val_y">0</span>
             </p>
+            <div class="pt-4">
+                <a href="/update_factory" class="text-[10px] text-gray-600 hover:text-indigo-400">韌體維護 (Factory OTA)</a>
+            </div>
         </div>
     </div>
 
@@ -337,6 +342,154 @@ const char* HTML_CONTENT = R"rawliteral(
     </script>
 </body>
 </html>
+// --- 自定義 Factory OTA 更新處理 ---
+void handleFactoryUpdate() {
+    server.send(200, "text/html", 
+        "<html><body>"
+        "<h1>Factory Partition Update</h1>"
+        "<div style='background:#f0f0f0; padding:15px; margin-bottom:20px;'>"
+        "<h3>Option 1: Update from Local File</h3>"
+        "<form method='POST' action='/update_factory' enctype='multipart/form-data'>"
+        "<input type='file' name='update'><input type='submit' value='Upload & Update Factory'>"
+        "</form></div>"
+        "<div style='background:#e0edff; padding:15px;'>"
+        "<h3>Option 2: Update from GitHub (Cloud)</h3>"
+        "<p>Target: <code>releases/latest/download/firmware.bin</code></p>"
+        "<button onclick=\"if(confirm('Are you sure? This will download the latest build from GitHub.')) location.href='/update_github';\">🚀 Start GitHub Cloud Update</button>"
+        "</div>"
+        "</body></html>");
+}
+
+void handleFactoryUpdateUpload() {
+    HTTPUpload& upload = server.upload();
+    static bool ota_started = false;
+    static const esp_partition_t* factory_partition = NULL;
+    static esp_ota_handle_t update_handle = 0;
+
+    if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("Factory OTA Start: %s\n", upload.filename.c_str());
+        factory_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+        if (factory_partition == NULL) {
+            Serial.println("❌ 找不到 Factory 分區!");
+            return;
+        }
+        esp_err_t err = esp_ota_begin(factory_partition, OTA_SIZE_UNKNOWN, &update_handle);
+        if (err != ESP_OK) {
+            Serial.printf("❌ esp_ota_begin 失敗: %s\n", esp_err_to_name(err));
+            return;
+        }
+        ota_started = true;
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (ota_started) {
+            esp_err_t err = esp_ota_write(update_handle, upload.buf, upload.currentSize);
+            if (err != ESP_OK) {
+                Serial.printf("❌ esp_ota_write 失敗: %s\n", esp_err_to_name(err));
+                ota_started = false;
+            }
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (ota_started) {
+            esp_err_t err = esp_ota_end(update_handle);
+            if (err != ESP_OK) {
+                Serial.printf("❌ esp_ota_end 失敗: %s\n", esp_err_to_name(err));
+            } else {
+                err = esp_ota_set_boot_partition(factory_partition);
+                if (err != ESP_OK) {
+                    Serial.printf("❌ 設定啟動分區失敗: %s\n", esp_err_to_name(err));
+                } else {
+                    Serial.println("✅ Factory OTA 更新成功! 正在重啟...");
+                    server.send(200, "text/plain", "SUCCESS. Rebooting...");
+                    delay(500);
+                    ESP.restart();
+                }
+            }
+        }
+        ota_started = false;
+    }
+}
+
+// --- GitHub 雲端 OTA 更新邏輯 ---
+void performGitHubCloudUpdate() {
+    String url = "https://github.com/VibeCoding-tw/esp32c3-launcher/releases/latest/download/firmware.bin";
+    Serial.println("--- 啟動 GitHub 雲端更新 ---");
+    Serial.print("Target: "); Serial.println(url);
+
+    WiFiClientSecure client;
+    client.setInsecure(); // 在此場景下跳過證書驗證以提高相容性
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // 必須追蹤 GitHub 的 302 重定向
+    
+    if (http.begin(client, url)) {
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+            int contentLength = http.getSize();
+            if (contentLength <= 0) {
+                Serial.println("❌ 無法取得檔案大小");
+                http.end();
+                return;
+            }
+
+            // 取得 Factory 分區
+            const esp_partition_t* factory_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+            if (factory_partition == NULL) {
+                Serial.println("❌ 找不到 Factory 分區!");
+                http.end();
+                return;
+            }
+
+            esp_ota_handle_t update_handle = 0;
+            esp_err_t err = esp_ota_begin(factory_partition, OTA_SIZE_UNKNOWN, &update_handle);
+            if (err != ESP_OK) {
+                Serial.printf("❌ esp_ota_begin 失敗: %s\n", esp_err_to_name(err));
+                http.end();
+                return;
+            }
+
+            WiFiClient* stream = http.getStreamPtr();
+            size_t written = 0;
+            uint8_t buff[1024];
+            
+            while (http.connected() && (written < contentLength)) {
+                size_t size = stream->available();
+                if (size) {
+                    int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+                    esp_ota_write(update_handle, buff, c);
+                    written += c;
+                    if (written % 10240 == 0) Serial.printf("Progress: %u%%\r", (written * 100) / contentLength);
+                }
+                delay(1);
+            }
+
+            if (written == contentLength) {
+                err = esp_ota_end(update_handle);
+                if (err == ESP_OK) {
+                    err = esp_ota_set_boot_partition(factory_partition);
+                    if (err == ESP_OK) {
+                        Serial.println("\n✅ GitHub 雲端更新成功! 正在重啟...");
+                        delay(500);
+                        ESP.restart();
+                    }
+                }
+            } else {
+                Serial.println("\n❌ 下載不完整");
+            }
+        } else {
+            Serial.printf("❌ HTTP GET 失敗, code: %d\n", httpCode);
+        }
+        http.end();
+    } else {
+        Serial.println("❌ 無法連線至 GitHub");
+    }
+}
+
+void handleGitHubUpdate() {
+    server.send(200, "text/plain", "Starting GitHub Cloud Update... Please wait and check Serial logs.");
+    // 延遲一下讓 Web Response 噴出去再開始
+    delay(500);
+    performGitHubCloudUpdate();
+}
+
 )rawliteral";
 
 // 產生基於 MAC 位址的 Hostname (保持不變)
@@ -590,6 +743,9 @@ void setupWebServer() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/control", HTTP_GET, handleControl);
     server.on("/config", HTTP_ANY, handleMotorConfig); // 新增配置接口
+    server.on("/update_factory", HTTP_GET, handleFactoryUpdate);
+    server.on("/update_factory", HTTP_POST, [](){}, handleFactoryUpdateUpload);
+    server.on("/update_github", HTTP_GET, handleGitHubUpdate);
     server.onNotFound([](){
         server.send(404, "text/plain", "Not Found");
     });

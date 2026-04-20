@@ -12,6 +12,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必要的權限來建立 Release
 
     steps:
       - name: Checkout code
@@ -44,8 +46,14 @@ jobs:
           name: esp32c3-firmware
           path: .pio/build/esp32c3-launcher/firmware.bin
 
-      - name: Upload Partitions Binary
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        if: github.ref == 'refs/heads/main' # 僅在 main 分支 push 時執行
+        uses: softprops/action-gh-release@v2
         with:
-          name: esp32c3-partitions
-          path: .pio/build/esp32c3-launcher/partitions.bin
+          tag_name: latest
+          name: "Latest Build"
+          body: "Auto-generated firmware from GitHub Actions"
+          files: .pio/build/esp32c3-launcher/firmware.bin
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
