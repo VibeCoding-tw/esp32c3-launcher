@@ -505,11 +505,11 @@ void loadMotorConfig() {
         .controlTimeoutT = 500, 
         .controlTimeoutS = 2000, 
         .pwmEffectiveLimitT = 200, 
-        .pwmStartKickT = 60, 
         .rampAccelStepT = 3, 
-        .pwmEffectiveLimitS = 255, // 提升至最大出力以應對回正彈簧
-        .rampAccelStepS = 10,      // 轉向需要較快響應
-        .pwmStartKickS = 120       // 提高起步力道克服靜摩擦
+        .pwmStartKickT = 60, 
+        .pwmEffectiveLimitS = 255, 
+        .rampAccelStepS = 10, 
+        .pwmStartKickS = 120
     };
 
     preferences.begin("motor-config", true);
