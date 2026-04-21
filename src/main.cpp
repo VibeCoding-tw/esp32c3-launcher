@@ -22,7 +22,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.06" 
+#define CURRENT_VERSION "2026.04.21.07" 
 WebServer server(80);                
 WebSocketsServer webSocket(81);      
 WiFiUDP udp;                         
@@ -140,7 +140,10 @@ static const char* JOYSTICK_PAGE_HTML = R"rawliteral(
         </div>
         <div id="joystick" class="mb-6"><div id="joystick-thumb"></div></div>
         <p id="status" class="text-center text-sm font-bold text-green-400 mb-4 uppercase tracking-widest">● 靜止 ●</p>
-        <div class="p-4 border-t border-gray-700 text-center text-[10px] text-gray-500"><a href="/update_factory" class="hover:text-indigo-400">韌體維修中心</a> | Ver %VERSION%</div>
+        <div class="p-4 border-t border-gray-700 text-center text-[10px] text-gray-500 flex justify-between items-center">
+            <span><a href="/update_factory" class="hover:text-indigo-400">韌體維修中心</a> | Ver %VERSION%</span>
+            <span id="conn_type" class="opacity-50">🌐</span>
+        </div>
     </div>
     <script>
         const joystick = document.getElementById('joystick'); const thumb = document.getElementById('joystick-thumb');
@@ -149,8 +152,14 @@ static const char* JOYSTICK_PAGE_HTML = R"rawliteral(
         const maxRadius = joystick.clientWidth/2;
         let isDragging = false, lastMotorT = 0, lastMotorS = 0;
         let ws = new WebSocket(`ws://${location.hostname}:81`);
+        const connType = document.getElementById('conn_type');
+        ws.onopen = () => connType.textContent = '⚡';
+        ws.onclose = () => connType.textContent = '🌐';
         
-        function send(t,s) { if(ws.readyState===1) ws.send(`${t},${s}`); }
+        function send(t,s) { 
+            if(ws.readyState===1) ws.send(`${t},${s}`); 
+            else fetch(`/control?t=${t}&s=${s}`); // HTTP 回退機制
+        }
         function fetchTelemetry() { fetch('/control?t='+lastMotorT+'&s='+lastMotorS).then(r=>r.json()).then(d=>{ valVEl.textContent=d.v.toFixed(2); valRTEl.textContent=d.rt; valRSELEl.textContent=d.rs; }); }
         setInterval(fetchTelemetry, 1000);
 
@@ -200,12 +209,24 @@ static const char* DPAD_PAGE_HTML = R"rawliteral(
             <div class="btn-dpad" ontouchstart="mt(0,255)" ontouchend="sp()"><svg class="w-8 h-8" viewBox="0 0 24 24" fill="currentColor"><path d="M20 12l-8-8v16z"/></svg></div>
             <div></div><div class="btn-dpad" ontouchstart="mt(-255,0)" ontouchend="sp()"><svg class="w-8 h-8" viewBox="0 0 24 24" fill="currentColor"><path d="M12 20l-8-8h16z"/></svg></div><div></div>
         </div>
-        <div class="text-center text-[10px] text-gray-600"><a href="/joystick" class="underline">切換至搖桿</a> | <a href="/update_factory" class="underline">維護中心</a> | Ver %VERSION%</div>
+        <div class="text-center text-[10px] text-gray-600 flex justify-between items-center px-2">
+            <span><a href="/joystick" class="underline">切換至搖桿</a> | <a href="/update_factory" class="underline">維護中心</a> | Ver %VERSION%</span>
+            <span id="conn_type" class="opacity-50">🌐</span>
+        </div>
     </div>
     <script>
         let ws = new WebSocket(`ws://${location.hostname}:81`);
-        function mt(t,s){ if(ws.readyState===1) ws.send(`${t},${s}`); }
-        function sp(){ if(ws.readyState===1) ws.send(`0,0`); }
+        const connType = document.getElementById('conn_type');
+        ws.onopen = () => connType.textContent = '⚡';
+        ws.onclose = () => connType.textContent = '🌐';
+        function mt(t,s){ 
+            if(ws.readyState===1) ws.send(`${t},${s}`); 
+            else fetch(`/control?t=${t}&s=${s}`); // HTTP 回退機制
+        }
+        function sp(){ 
+            if(ws.readyState===1) ws.send(`0,0`); 
+            else fetch(`/control?t=0&s=0`); // HTTP 回退機制
+        }
         setInterval(()=>{ fetch('/control?t=0&s=0').then(r=>r.json()).then(d=>{ document.getElementById('val_v').textContent=d.v.toFixed(2); document.getElementById('val_rt').textContent=d.rt; document.getElementById('val_rs').textContent=d.rs; }); }, 2000);
     </script>
 </body>
@@ -513,9 +534,17 @@ void setupBleServer_Bluedroid() {
 
 void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
     if (type == WStype_TEXT) {
-        String msg = String((char*)payload);
+        char buffer[length + 1];
+        memcpy(buffer, payload, length);
+        buffer[length] = '\0';
+        String msg = String(buffer);
+        
         int idx = msg.indexOf(',');
-        if (idx > 0) { targetSpeedT = msg.substring(0,idx).toInt(); targetSpeedS = msg.substring(idx+1).toInt(); lastControlTime = millis(); }
+        if (idx > 0) { 
+            targetSpeedT = msg.substring(0,idx).toInt(); 
+            targetSpeedS = msg.substring(idx+1).toInt(); 
+            lastControlTime = millis(); 
+        }
     }
 }
 
@@ -562,7 +591,6 @@ void loop() {
         server.begin(); webSocket.begin(); webSocket.onEvent(onWsEvent); udp.begin(UDP_PORT);
         servicesStarted = true; checkAndPerformAutoUpdate();
     }
-    if (servicesStarted) server.handleClient();
     if (!isUpdating) { motorRampTask(); updateBatteryVoltage(); if(millis()-lastControlTime>1000){targetSpeedT=0;targetSpeedS=0;} }
     if (should_restart_advertising && pServer) { pServer->startAdvertising(); should_restart_advertising = false; }
     delay(1);
