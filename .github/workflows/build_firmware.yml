@@ -40,11 +40,18 @@ jobs:
       - name: Build Firmware
         run: pio run
 
-      - name: Upload Firmware Binary
+      - name: Extract Version
+        run: |
+          grep 'const char\* CURRENT_VERSION =' src/main.cpp | cut -d '"' -f 2 > .pio/build/esp32c3-launcher/version.txt
+          echo "Building Version: $(cat .pio/build/esp32c3-launcher/version.txt)"
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32c3-firmware
-          path: .pio/build/esp32c3-launcher/firmware.bin
+          path: |
+            .pio/build/esp32c3-launcher/firmware.bin
+            .pio/build/esp32c3-launcher/version.txt
 
       - name: Create Release
         if: github.ref == 'refs/heads/main' # 僅在 main 分支 push 時執行
@@ -52,8 +59,10 @@ jobs:
         with:
           tag_name: latest
           name: "Latest Build"
-          body: "Auto-generated firmware from GitHub Actions"
-          files: .pio/build/esp32c3-launcher/firmware.bin
+          body: "Auto-generated firmware and version info from GitHub Actions"
+          files: |
+            .pio/build/esp32c3-launcher/firmware.bin
+            .pio/build/esp32c3-launcher/version.txt
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

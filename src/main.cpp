@@ -21,6 +21,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
+const char* CURRENT_VERSION = "2026.04.21.01"; // 目前韌體版本
 WebServer server(80);                // 實例化同步 Web Server
 
 // LEDC PWM 設定 (保持不變)
@@ -34,14 +35,16 @@ const int LEDC_CH_B2 = 3;
 
 // --- 馬達 Ramping 參數結構體 (與需求一致) ---
 typedef struct {
-    uint16_t controlTimeoutT; // 補償：加速馬達超時 (ms)
-    uint16_t controlTimeoutS; // 補償：轉向馬達超時 (ms)
+    uint16_t controlTimeoutT; 
+    uint16_t controlTimeoutS; 
     int pwmEffectiveLimitT; 
     int rampAccelStepT; 
     int pwmStartKickT; 
     int pwmEffectiveLimitS; 
     int rampAccelStepS; 
     int pwmStartKickS;
+    uint8_t autoUpdateEnabled; // 是否開啟開機自動檢查更新 (0:關閉, 1:開啟)
+    uint8_t padding;           // 對齊用
 } MotorConfig_t;
 
 // 【修正點 2】馬達 Ramping 核心變數
@@ -349,22 +352,154 @@ const char* HTML_CONTENT = R"rawliteral(
     </script>
 </body>
 </html>)rawliteral";
+
+const char UPDATE_PAGE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Updating Vibe Racer...</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; color: #f9fafb; font-family: system-ui; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); border-radius: 24px; }
+        .spinner { border: 4px solid rgba(255, 255, 255, 0.1); border-left-color: #6366f1; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="p-4 text-center">
+    <div class="glass p-8 max-w-sm w-full shadow-2xl">
+        <div class="flex justify-center mb-6">
+            <div class="spinner"></div>
+        </div>
+        <h1 class="text-2xl font-bold text-indigo-400 mb-2">系統更新中...</h1>
+        <p class="text-gray-400 text-sm mb-6">正在從 GitHub 獲取最新韌體，請勿關閉電源。</p>
+        
+        <div class="space-y-3 text-left text-xs text-gray-500 mb-8">
+            <div class="flex items-center space-x-2"><span class="w-2 h-2 bg-green-500 rounded-full"></span> <span>連線至 GitHub...</span></div>
+            <div class="flex items-center space-x-2"><span class="w-2 h-2 bg-indigo-500 rounded-full animate-pulse"></span> <span>下載並寫入 Flash...</span></div>
+            <div class="flex items-center space-x-2"><span class="w-2 h-2 bg-gray-600 rounded-full"></span> <span>重新啟動裝置...</span></div>
+        </div>
+
+        <p id="countdown" class="text-indigo-300/60 text-xs">預計於 40 秒後自動跳轉</p>
+    </div>
+
+    <script>
+        let timeLeft = 40;
+        const countdownEl = document.getElementById('countdown');
+        const timer = setInterval(() => {
+            timeLeft--;
+            countdownEl.textContent = `預計於 ${timeLeft} 秒後自動跳轉`;
+            if (timeLeft <= 0) {
+                clearInterval(timer);
+                location.href = '/';
+            }
+        }, 1000);
+
+        // 30 秒後開始嘗試連線小車，一旦成功就跳轉
+        setTimeout(() => {
+            setInterval(() => {
+                fetch('/').then(r => { if(r.ok) location.href = '/'; }).catch(e => {});
+            }, 3000);
+        }, 30000);
+    </script>
+</body>
+</html>)rawliteral";
+const char MAINTENANCE_PAGE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vibe Racer Maintenance</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; color: #f9fafb; font-family: system-ui; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem;}
+        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); border-radius: 24px; width: 100%; max-width: 450px; overflow: hidden; }
+        .section { border-bottom: 1px solid rgba(255,255,255,0.05); padding: 1.5rem; }
+        .btn { transition: all 0.2s; cursor: pointer; border-radius: 12px; font-weight: bold; }
+        .btn:hover { transform: translateY(-1px); }
+        input[type="file"]::file-selector-button { background: #374151; color: white; padding: 0.5rem 1rem; border: none; border-radius: 8px; margin-right: 1rem; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="glass shadow-2xl">
+        <div class="bg-indigo-600/20 p-6 border-b border-indigo-500/30">
+            <h1 class="text-2xl font-bold text-indigo-300">維修與更新</h1>
+            <p class="text-xs text-gray-400 mt-1">裝置 ID: %HOSTNAME% | 版本: <span class="text-indigo-400 font-mono">%VERSION%</span></p>
+        </div>
+
+        <!-- 系統設定區 -->
+        <div class="section">
+            <h2 class="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">系統設定</h2>
+            <div class="flex items-center justify-between p-4 bg-white/5 rounded-2xl border border-white/5">
+                <div>
+                    <h3 class="font-bold text-gray-200">開機自動更新</h3>
+                    <p class="text-xs text-gray-500">開機連網後自動檢查 GitHub 版本</p>
+                </div>
+                <button onclick="location.href='/toggle_auto_update'" class="relative inline-flex items-center h-6 rounded-full w-11 transition-colors focus:outline-none %TOGGLE_BG_COLOR%">
+                    <span class="inline-block w-4 h-4 transform bg-white rounded-full transition-transform %TOGGLE_DOT_POS%"></span>
+                </button>
+            </div>
+        </div>
+
+        <!-- GitHub 更新區 -->
+        <div class="section bg-indigo-500/5">
+            <h2 class="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">雲端更新 (GitHub)</h2>
+            <div class="p-4 rounded-2xl border border-indigo-500/20">
+                <p class="text-xs text-gray-500 mb-4">自動抓取 <code>latest/firmware.bin</code> 並更新至 Factory 分區。</p>
+                <button onclick="if(confirm('確認要從 GitHub 下載最新韌體？')) location.href='/update_github';" 
+                    class="w-full btn bg-indigo-600 hover:bg-indigo-500 text-white p-3 shadow-lg flex items-center justify-center space-x-2">
+                    <span>🚀 啟動 GitHub 雲端更新</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- 本地上傳區 -->
+        <div class="section">
+            <h2 class="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">本地上傳 (Manual)</h2>
+            <form method="POST" action="/update_factory" enctype="multipart/form-data" class="space-y-4">
+                <div class="p-4 bg-gray-900/40 rounded-2xl border border-white/5">
+                    <input type="file" name="update" class="text-xs text-gray-400 w-full">
+                </div>
+                <button type="submit" class="w-full btn bg-gray-700 hover:bg-gray-600 text-gray-300 p-3">
+                    傳送並更新 Factory 分區
+                </button>
+            </form>
+        </div>
+
+        <div class="p-4 text-center">
+            <a href="/" class="text-xs text-gray-500 hover:text-indigo-400 transition">← 返回控制主頁</a>
+        </div>
+    </div>
+</body>
+</html>)rawliteral";
+
 // --- 自定義 Factory OTA 更新處理 ---
 void handleFactoryUpdate() {
-    server.send(200, "text/html", 
-        "<html><body>"
-        "<h1>Factory Partition Update</h1>"
-        "<div style='background:#f0f0f0; padding:15px; margin-bottom:20px;'>"
-        "<h3>Option 1: Update from Local File</h3>"
-        "<form method='POST' action='/update_factory' enctype='multipart/form-data'>"
-        "<input type='file' name='update'><input type='submit' value='Upload & Update Factory'>"
-        "</form></div>"
-        "<div style='background:#e0edff; padding:15px;'>"
-        "<h3>Option 2: Update from GitHub (Cloud)</h3>"
-        "<p>Target: <code>releases/latest/download/firmware.bin</code></p>"
-        "<button onclick=\"if(confirm('Are you sure? This will download the latest build from GitHub.')) location.href='/update_github';\">🚀 Start GitHub Cloud Update</button>"
-        "</div>"
-        "</body></html>");
+    String html = MAINTENANCE_PAGE_HTML;
+    html.replace("%HOSTNAME%", globalHostname);
+    html.replace("%VERSION%", CURRENT_VERSION);
+    
+    // 處理 Toggle 狀態
+    if (motorConfig.autoUpdateEnabled == 1) {
+        html.replace("%TOGGLE_BG_COLOR%", "bg-indigo-600");
+        html.replace("%TOGGLE_DOT_POS%", "translate-x-6");
+    } else {
+        html.replace("%TOGGLE_BG_COLOR%", "bg-gray-700");
+        html.replace("%TOGGLE_DOT_POS%", "translate-x-1");
+    }
+
+    server.send(200, "text/html", html);
+}
+
+void handleToggleAutoUpdate() {
+    motorConfig.autoUpdateEnabled = (motorConfig.autoUpdateEnabled == 1) ? 0 : 1;
+    saveMotorConfig();
+    // 重新跳轉回維修頁面
+    server.sendHeader("Location", "/update_factory");
+    server.send(303);
 }
 
 void handleFactoryUpdateUpload() {
@@ -491,10 +626,45 @@ void performGitHubCloudUpdate() {
 }
 
 void handleGitHubUpdate() {
-    server.send(200, "text/plain", "Starting GitHub Cloud Update... Please wait and check Serial logs.");
+    server.send(200, "text/html", UPDATE_PAGE_HTML);
     // 延遲一下讓 Web Response 噴出去再開始
-    delay(500);
+    delay(1000);
     performGitHubCloudUpdate();
+}
+
+// 檢查遠端版本並決定是否更新
+void checkAndPerformAutoUpdate() {
+    if (motorConfig.autoUpdateEnabled != 1) {
+        Serial.println("[AutoUpdate] 功能已關閉，跳過檢查。");
+        return;
+    }
+
+    Serial.println("[AutoUpdate] 正在檢查 GitHub 上的最新版本...");
+    String versionUrl = "https://github.com/VibeCoding-tw/esp32c3-launcher/releases/latest/download/version.txt";
+    
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+    if (http.begin(client, versionUrl)) {
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK) {
+            String remoteVersion = http.getString();
+            remoteVersion.trim();
+            Serial.printf("[AutoUpdate] 本地版本: %s, 遠端版本: %s\n", CURRENT_VERSION, remoteVersion.c_str());
+            
+            if (remoteVersion != CURRENT_VERSION && remoteVersion.length() > 0) {
+                Serial.println("[AutoUpdate] 偵測到新版本! 準備開始自動更新...");
+                performGitHubCloudUpdate();
+            } else {
+                Serial.println("[AutoUpdate] 目前已是最新版本。");
+            }
+        } else {
+            Serial.printf("[AutoUpdate] 無法取得版本資訊, code: %d\n", httpCode);
+        }
+        http.end();
+    }
 }
 
 // --- 產生 Hostname ---
@@ -516,7 +686,9 @@ void loadMotorConfig() {
         .pwmStartKickT = 60, 
         .pwmEffectiveLimitS = 255, 
         .rampAccelStepS = 20, // 提升轉向步長至 20
-        .pwmStartKickS = 120
+        .pwmStartKickS = 120,
+        .autoUpdateEnabled = 0, // 預設關閉自動更新以策安全
+        .padding = 0
     };
 
     preferences.begin("motor-config", true);
@@ -534,6 +706,7 @@ void loadMotorConfig() {
     Serial.printf("  Timeout T: %u ms, S: %u ms\n", motorConfig.controlTimeoutT, motorConfig.controlTimeoutS);
     Serial.printf("  T Limit: %d, T Step: %d, T Kick: %d\n", motorConfig.pwmEffectiveLimitT, motorConfig.rampAccelStepT, motorConfig.pwmStartKickT);
     Serial.printf("  S Limit: %d, S Step: %d, S Kick: %d\n", motorConfig.pwmEffectiveLimitS, motorConfig.rampAccelStepS, motorConfig.pwmStartKickS);
+    Serial.printf("  Auto Update: %s\n", motorConfig.autoUpdateEnabled ? "Enabled" : "Disabled");
 }
 
 // 將當前參數儲存到 NVS
@@ -728,6 +901,7 @@ void handleMotorConfig() {
         if (server.hasArg("limitS")) motorConfig.pwmEffectiveLimitS = server.arg("limitS").toInt();
         if (server.hasArg("stepS")) motorConfig.rampAccelStepS = server.arg("stepS").toInt();
         if (server.hasArg("kickS")) motorConfig.pwmStartKickS = server.arg("kickS").toInt();
+        if (server.hasArg("autoUpdate")) motorConfig.autoUpdateEnabled = server.arg("autoUpdate").toInt();
 
         saveMotorConfig(); // 儲存到 NVS
         
@@ -751,6 +925,7 @@ void setupWebServer() {
     server.on("/update_factory", HTTP_GET, handleFactoryUpdate);
     server.on("/update_factory", HTTP_POST, [](){}, handleFactoryUpdateUpload);
     server.on("/update_github", HTTP_GET, handleGitHubUpdate);
+    server.on("/toggle_auto_update", HTTP_GET, handleToggleAutoUpdate);
     server.onNotFound([](){
         server.send(404, "text/plain", "Not Found");
     });
@@ -1036,6 +1211,11 @@ void loop() {
         Serial.println("-------------------------------------------------------");
         Serial.printf("裝置已啟動: %s.local\n", globalHostname.c_str()); 
         Serial.println("-------------------------------------------------------");
+        
+        // --- 開機自動更新檢查 ---
+        // 稍微延遲一下，確保網路完全穩定
+        delay(1000); 
+        checkAndPerformAutoUpdate();
     }
 
     // 4. Web Server 和 OTA 僅在服務啟動後才處理
