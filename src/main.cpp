@@ -165,14 +165,36 @@ const char* HTML_CONTENT = R"rawliteral(
         </p>
 
         <!-- 電量與診斷資訊 -->
-        <div class="flex justify-between items-center bg-gray-900/50 rounded-lg p-3 mb-6 border border-gray-700">
-            <div class="text-left">
-                <p class="text-xs text-gray-500 uppercase tracking-wider">電池電壓</p>
-                <p class="text-xl font-mono font-bold text-green-400"><span id="val_v">0.00</span>V</p>
+        <div class="bg-gray-900/50 rounded-lg p-3 mb-6 border border-gray-700">
+            <div class="flex justify-between items-center mb-3">
+                <div class="text-left">
+                    <p class="text-xs text-gray-500 uppercase tracking-wider font-bold">電池電壓 Battery</p>
+                    <p class="text-xl font-mono font-bold text-green-400"><span id="val_v">0.00</span>V</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-xs text-gray-500 uppercase tracking-wider font-bold">即時功率 Realtime</p>
+                    <p class="text-sm font-mono text-indigo-300">T: <span id="val_rt">0</span> | S: <span id="val_rs">0</span></p>
+                </div>
             </div>
-            <div class="text-right">
-                <p class="text-xs text-gray-500 uppercase tracking-wider">即時功率 (Ramp)</p>
-                <p class="text-sm font-mono text-indigo-300">T: <span id="val_rt">0</span> | S: <span id="val_rs">0</span></p>
+            
+            <!-- 馬達參數儀表板 (New) -->
+            <div class="grid grid-cols-2 gap-2 border-t border-gray-700 pt-3">
+                <div class="space-y-1">
+                    <p class="text-[10px] text-gray-500 font-bold uppercase tracking-tighter">加速配置 (T-Config)</p>
+                    <div class="flex space-x-1">
+                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">L:<span id="cfg_lt">-</span></span>
+                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">S:<span id="cfg_st">-</span></span>
+                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">K:<span id="cfg_kt">-</span></span>
+                    </div>
+                </div>
+                <div class="space-y-1 border-l border-gray-800 pl-2">
+                    <p class="text-[10px] text-gray-500 font-bold uppercase tracking-tighter">轉向配置 (S-Config)</p>
+                    <div class="flex space-x-1">
+                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">L:<span id="cfg_ls">-</span></span>
+                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">S:<span id="cfg_ss">-</span></span>
+                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">K:<span id="cfg_ks">-</span></span>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -253,6 +275,29 @@ const char* HTML_CONTENT = R"rawliteral(
             lastMotorT = speedT;
             lastMotorS = speedS;
         }
+
+        // Config Elements Dashboard
+        const cfgLT = document.getElementById('cfg_lt');
+        const cfgST = document.getElementById('cfg_st');
+        const cfgKT = document.getElementById('cfg_kt');
+        const cfgLS = document.getElementById('cfg_ls');
+        const cfgSS = document.getElementById('cfg_ss');
+        const cfgKS = document.getElementById('cfg_ks');
+
+        function fetchConfig() {
+            fetch('/config')
+                .then(r => r.json())
+                .then(data => {
+                    if(cfgLT) cfgLT.textContent = data.pwmEffectiveLimitT;
+                    if(cfgST) cfgST.textContent = data.rampAccelStepT;
+                    if(cfgKT) cfgKT.textContent = data.pwmStartKickT;
+                    if(cfgLS) cfgLS.textContent = data.pwmEffectiveLimitS;
+                    if(cfgSS) cfgSS.textContent = data.rampAccelStepS;
+                    if(cfgKS) cfgKS.textContent = data.pwmStartKickS;
+                })
+                .catch(e => console.error('Config fetch failed', e));
+        }
+        fetchConfig();
 
         function sendControl(T, S) {
             fetch(`${baseIp}/control?t=${T}&s=${S}`)
@@ -1111,16 +1156,24 @@ void setupBleServer_Bluedroid() {
     // 3. Wi-Fi 配置服務
     BLEService *pConfigService = pServer->createService(CONFIG_SERVICE_UUID);
     
+    // 從 NVS 讀取目前儲存的 Wi-Fi 資訊，以便客戶端讀取
+    preferences.begin("wifi-config", true);
+    String current_ssid = preferences.getString("ssid", "");
+    String current_pass = preferences.getString("pass", "");
+    preferences.end();
+
     pSsidCharacteristic = pConfigService->createCharacteristic(
         SSID_CHAR_UUID, 
-        BLECharacteristic::PROPERTY_WRITE
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
     );
+    pSsidCharacteristic->setValue(current_ssid.c_str());
     pSsidCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
 
     pPassCharacteristic = pConfigService->createCharacteristic(
         PASS_CHAR_UUID, 
-        BLECharacteristic::PROPERTY_WRITE
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
     );
+    pPassCharacteristic->setValue(current_pass.c_str());
     pPassCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
     
     // 啟動服務
