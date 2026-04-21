@@ -21,7 +21,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-const char* CURRENT_VERSION = "2026.04.21.01"; // 目前韌體版本
+const char* CURRENT_VERSION = "2026.04.21.02"; // 目前韌體版本
 WebServer server(80);                // 實例化同步 Web Server
 
 // LEDC PWM 設定 (保持不變)
@@ -241,13 +241,11 @@ const char* HTML_CONTENT = R"rawliteral(
                  else currentStatus = "移動中";
             }
             statusEl.textContent = currentStatus;
-            statusEl.className = statusEl.className.replace(/text-\w+-\d+/, statusColor);
+            statusEl.className = "text-sm font-bold " + statusColor;
 
-            if (speedT !== lastMotorT || speedS !== lastMotorS) {
-                lastMotorT = speedT;
-                lastMotorS = speedS;
-                sendControl(speedT, speedS); 
-            }
+            // 僅更新快取，實際發送由 setInterval 負責
+            lastMotorT = speedT;
+            lastMotorS = speedS;
         }
 
         function sendControl(T, S) {
@@ -279,8 +277,12 @@ const char* HTML_CONTENT = R"rawliteral(
             isDragging = false;
             if (controlInterval) clearInterval(controlInterval);
             resetThumbPosition();
-            // 發送 T=0, S=0，觸發 ESP32 端的即時停止
+            
+            // 歸零快取並發送最後一次停止命令
+            lastMotorT = 0;
+            lastMotorS = 0;
             updateMotorValues(0, 0); 
+            sendControl(0, 0);
         }
 
         function handleMove(e) {
@@ -326,12 +328,12 @@ const char* HTML_CONTENT = R"rawliteral(
             thumb.classList.add('active');
             handleMove(e); // 立即更新一次位置和值
 
-            // 設置間隔發送，確保命令持續性
+            // 使用定時器發送控制命令 (20Hz / 每 50ms 一次)
+            // 這樣可以平衡「即時性」與「網路負擔」，避免因請求過快導致 ESP32 當機
             if (controlInterval) clearInterval(controlInterval);
             controlInterval = setInterval(() => {
-                // 重新讀取上次計算的值並發送，確保命令持續性
                 sendControl(lastMotorT, lastMotorS);
-            }, 100); // 每 100ms 發送一次
+            }, 50); 
         }
 
         function handleEnd() {
