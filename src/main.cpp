@@ -87,6 +87,12 @@ const float DIVIDER_RATIO = 2.0;     // 分壓比例 ( 100k+100k )
 unsigned long lastBatteryCheck = 0;
 const int BATT_CHECK_INTERVAL = 500; // 每 500ms 檢查一次
 
+// --- 函式前置宣告 (Forward Declarations) ---
+void loadMotorConfig();
+void saveMotorConfig();
+void performGitHubCloudUpdate();
+void checkAndPerformAutoUpdate();
+
 // --- HTML 網頁內容 ---
 const char* HTML_CONTENT = R"rawliteral(
 <!DOCTYPE html>
