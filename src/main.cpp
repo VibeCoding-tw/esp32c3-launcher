@@ -22,7 +22,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.10" 
+#define CURRENT_VERSION "2026.04.21.11" 
 WebServer server(80);                
 WebSocketsServer webSocket(81);      
 WiFiUDP udp;                         
@@ -435,13 +435,6 @@ class MyCharCallbacks: public BLECharacteristicCallbacks {
 
 // [NEW] WiFi SSID 讀取/寫入回調
 class WiFiSsidCallbacks: public BLECharacteristicCallbacks {
-    void onRead(BLECharacteristic* p) {
-        preferences.begin("wifi-config", true);
-        String s = preferences.getString("ssid", "");
-        preferences.end();
-        Serial.printf("📡 BLE Read SSID: %s\n", s.c_str());
-        p->setValue(s.c_str());
-    }
     void onWrite(BLECharacteristic* p) {
         std::string val = p->getValue();
         if (val.length() > 0) {
@@ -453,13 +446,6 @@ class WiFiSsidCallbacks: public BLECharacteristicCallbacks {
 
 // [NEW] WiFi Password 讀取/寫入回調
 class WiFiPassCallbacks: public BLECharacteristicCallbacks {
-    void onRead(BLECharacteristic* p) {
-        preferences.begin("wifi-config", true);
-        String p_val = preferences.getString("pass", "");
-        preferences.end();
-        Serial.println("📡 BLE Read Password (hidden)");
-        p->setValue(p_val.c_str());
-    }
     void onWrite(BLECharacteristic* p) {
         std::string val = p->getValue();
         if (val.length() > 0) {
@@ -476,18 +462,14 @@ class WiFiPassCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-// [NEW] 馬達組態 (28-byte) 讀取/寫入回調
 class MotorConfigCallbacks: public BLECharacteristicCallbacks {
-    void onRead(BLECharacteristic* p) {
-        Serial.println("📡 BLE Read Motor Config.");
-        p->setValue((uint8_t*)&motorConfig, sizeof(MotorConfig_t));
-    }
     void onWrite(BLECharacteristic* p) {
         std::string rxValue = p->getValue();
         if (rxValue.length() == sizeof(MotorConfig_t)) {
             memcpy(&motorConfig, rxValue.data(), sizeof(MotorConfig_t));
             saveMotorConfig();
             Serial.println("✅ Motor Config updated via BLE.");
+            p->setValue((uint8_t*)&motorConfig, sizeof(MotorConfig_t)); // 同步回寫
         }
     }
 };
@@ -520,6 +502,9 @@ void setupBleServer_Bluedroid() {
     preferences.end();
     
     pSvcConfig->start();
+
+    // [v11] 增加 MTU 支援
+    BLEDevice::setMTU(512);
 
     // 廣播設定優化 (解決 31-byte 限制導致 UUID 遺失問題)
     BLEAdvertising *pAdv = BLEDevice::getAdvertising();
