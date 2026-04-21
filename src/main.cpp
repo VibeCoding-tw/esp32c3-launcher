@@ -22,7 +22,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.11" 
+#define CURRENT_VERSION "2026.04.21.12" 
 WebServer server(80);                
 WebSocketsServer webSocket(81);      
 WiFiUDP udp;                         
@@ -351,12 +351,15 @@ void saveMotorConfig() {
 
 void setMotorPwm(int t, int s) {
     if (t != 0 || s != 0) Serial.printf("DRV -> T:%d, S:%d (Batt: %.2fV)\n", t, s, batteryVoltage);
-    if (t > 0) { ledcWrite(LEDC_CH_A2, 0); ledcWrite(LEDC_CH_A1, t); }
-    else if (t < 0) { ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, -t); }
-    else { ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, 0); }
-    if (s > 0) { ledcWrite(LEDC_CH_B1, 0); ledcWrite(LEDC_CH_B2, s); }
-    else if (s < 0) { ledcWrite(LEDC_CH_B2, 0); ledcWrite(LEDC_CH_B1, -s); }
-    else { ledcWrite(LEDC_CH_B1, 0); ledcWrite(LEDC_CH_B2, 0); }
+    
+    // [v12] 改用 analogWrite 以獲得最大相容性，避開 LEDC 庫版本衝突
+    if (t > 0) { analogWrite(AIN2_PIN, 0); analogWrite(AIN1_PIN, t); }
+    else if (t < 0) { analogWrite(AIN1_PIN, 0); analogWrite(AIN2_PIN, -t); }
+    else { analogWrite(AIN1_PIN, 0); analogWrite(AIN2_PIN, 0); }
+    
+    if (s > 0) { analogWrite(BIN1_PIN, 0); analogWrite(BIN2_PIN, s); }
+    else if (s < 0) { analogWrite(BIN2_PIN, 0); analogWrite(BIN1_PIN, -s); }
+    else { analogWrite(BIN1_PIN, 0); analogWrite(BIN2_PIN, 0); }
 }
 
 void motorRampTask() {
@@ -572,6 +575,22 @@ void loop() {
         checkUdpControl();
         server.handleClient();
     }
+    
+    // [v12] 加入串口除錯控制台：輸入 T:255,S:0 即可直接測試馬達
+    if (Serial.available()) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        if (input.startsWith("T:")) {
+            int comma = input.indexOf(',');
+            if (comma > 0) {
+                targetSpeedT = input.substring(2, comma).toInt();
+                targetSpeedS = input.substring(comma+3).toInt(); // 跳過 S:
+                lastControlTime = millis();
+                Serial.printf("🛠️ Manual Serial Set -> T:%d, S:%d\n", targetSpeedT, targetSpeedS);
+            }
+        }
+    }
+
     if (WiFi.status() == WL_CONNECTED && !servicesStarted) {
         MDNS.begin(globalHostname.c_str());
         server.on("/", handleRoot); server.on("/joystick", handleJoystick); server.on("/control", handleControl);
