@@ -22,7 +22,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.05" 
+#define CURRENT_VERSION "2026.04.21.06" 
 WebServer server(80);                
 WebSocketsServer webSocket(81);      
 WiFiUDP udp;                         
@@ -497,13 +497,18 @@ void setupBleServer_Bluedroid() {
     pPassCharacteristic->setCallbacks(new WiFiPassCallbacks());
     pSvcConfig->start();
 
-    // 廣播設定
+    // 廣播設定優化 (解決 31-byte 限制導致 UUID 遺失問題)
     BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-    pAdv->addServiceUUID(MOTOR_SERVICE_UUID);
-    pAdv->addServiceUUID(CONFIG_SERVICE_UUID);
-    pAdv->start();
     
-    Serial.println("🤖 BLE Services (Motor + WiFi Config) Started.");
+    // 優先在主廣告中加入 Config Service，確保配置工具能掃描到
+    pAdv->addServiceUUID(CONFIG_SERVICE_UUID);
+    
+    // 啟用掃描回應 (Scan Response)，並將馬達服務放入其中
+    pAdv->setScanResponse(true);
+    pAdv->addServiceUUID(MOTOR_SERVICE_UUID); 
+    
+    pAdv->start();
+    Serial.println("🤖 BLE Services (Motor + WiFi Config) Started with optimized advertising (v06).");
 }
 
 void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
