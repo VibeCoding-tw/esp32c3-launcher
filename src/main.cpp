@@ -22,7 +22,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.07" 
+#define CURRENT_VERSION "2026.04.21.09" 
 WebServer server(80);                
 WebSocketsServer webSocket(81);      
 WiFiUDP udp;                         
@@ -338,7 +338,8 @@ void checkAndPerformAutoUpdate() {
 void loadMotorConfig() {
     preferences.begin("motor-config", true);
     if (preferences.getBytes("config", &motorConfig, sizeof(MotorConfig_t)) != sizeof(MotorConfig_t)) {
-        motorConfig = {500, 2000, 200, 3, 60, 255, 20, 120, 1, 0};
+        // 預設值: T逾時, S逾時, T極限, T加速度, T啟動, S極限, S加速度, S啟動, 自動更新, 填充
+        motorConfig = {1000, 1000, 255, 20, 60, 255, 20, 60, 1, 0};
     }
     preferences.end();
 }
@@ -349,6 +350,7 @@ void saveMotorConfig() {
 }
 
 void setMotorPwm(int t, int s) {
+    if (t != 0 || s != 0) Serial.printf("DRV -> T:%d, S:%d (Batt: %.2fV)\n", t, s, batteryVoltage);
     if (t > 0) { ledcWrite(LEDC_CH_A2, 0); ledcWrite(LEDC_CH_A1, t); }
     else if (t < 0) { ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, -t); }
     else { ledcWrite(LEDC_CH_A1, 0); ledcWrite(LEDC_CH_A2, 0); }
@@ -404,8 +406,8 @@ void handleToggleAutoUpdate() { motorConfig.autoUpdateEnabled = !motorConfig.aut
 
 // --- BLE Callbacks ---
 class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* p) { Serial.println("BLE Connected."); }
-    void onDisconnect(BLEServer* p) { should_restart_advertising = true; }
+    void onConnect(BLEServer* p) { Serial.println("📡 BLE Connected."); }
+    void onDisconnect(BLEServer* p) { Serial.println("📡 BLE Disconnected."); should_restart_advertising = true; }
 };
 
 class MyCharCallbacks: public BLECharacteristicCallbacks {
@@ -429,6 +431,7 @@ class WiFiSsidCallbacks: public BLECharacteristicCallbacks {
         preferences.begin("wifi-config", true);
         String s = preferences.getString("ssid", "");
         preferences.end();
+        Serial.printf("📡 BLE Read SSID: %s\n", s.c_str());
         p->setValue(s.c_str());
     }
     void onWrite(BLECharacteristic* p) {
@@ -446,6 +449,7 @@ class WiFiPassCallbacks: public BLECharacteristicCallbacks {
         preferences.begin("wifi-config", true);
         String p_val = preferences.getString("pass", "");
         preferences.end();
+        Serial.println("📡 BLE Read Password (hidden)");
         p->setValue(p_val.c_str());
     }
     void onWrite(BLECharacteristic* p) {
@@ -467,6 +471,7 @@ class WiFiPassCallbacks: public BLECharacteristicCallbacks {
 // [NEW] 馬達組態 (28-byte) 讀取/寫入回調
 class MotorConfigCallbacks: public BLECharacteristicCallbacks {
     void onRead(BLECharacteristic* p) {
+        Serial.println("📡 BLE Read Motor Config.");
         p->setValue((uint8_t*)&motorConfig, sizeof(MotorConfig_t));
     }
     void onWrite(BLECharacteristic* p) {
@@ -486,36 +491,26 @@ void setupBleServer_Bluedroid() {
 
     // 1. 馬達服務 (控制 + 組態)
     BLEService *pSvcMotor = pServer->createService(MOTOR_SERVICE_UUID);
-    
-    // 控制特徵值 (T,S 字串)
-    pControlCharacteristic = pSvcMotor->createCharacteristic(
-        MOTOR_CONTROL_CHAR_UUID, 
-        BLECharacteristic::PROPERTY_WRITE
-    );
+    pControlCharacteristic = pSvcMotor->createCharacteristic(MOTOR_CONTROL_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
     pControlCharacteristic->setCallbacks(new MyCharCallbacks());
-
-    // 組態特徵值 (28-byte Binary)
-    pMotorConfigCharacteristic = pSvcMotor->createCharacteristic(
-        MOTOR_CONFIG_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
-    );
+    pMotorConfigCharacteristic = pSvcMotor->createCharacteristic(MOTOR_CONFIG_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     pMotorConfigCharacteristic->setCallbacks(new MotorConfigCallbacks());
+    pMotorConfigCharacteristic->setValue((uint8_t*)&motorConfig, sizeof(MotorConfig_t)); // 預載
     pSvcMotor->start();
 
     // 2. 設定服務 (WiFi)
     BLEService *pSvcConfig = pServer->createService(CONFIG_SERVICE_UUID);
-    
-    pSsidCharacteristic = pSvcConfig->createCharacteristic(
-        SSID_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
-    );
+    pSsidCharacteristic = pSvcConfig->createCharacteristic(SSID_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     pSsidCharacteristic->setCallbacks(new WiFiSsidCallbacks());
-
-    pPassCharacteristic = pSvcConfig->createCharacteristic(
-        PASS_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
-    );
+    pPassCharacteristic = pSvcConfig->createCharacteristic(PASS_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     pPassCharacteristic->setCallbacks(new WiFiPassCallbacks());
+    
+    // 預載 WiFi 設定
+    preferences.begin("wifi-config", true);
+    pSsidCharacteristic->setValue(preferences.getString("ssid","").c_str());
+    pPassCharacteristic->setValue(preferences.getString("pass","").c_str());
+    preferences.end();
+    
     pSvcConfig->start();
 
     // 廣播設定優化 (解決 31-byte 限制導致 UUID 遺失問題)
@@ -544,6 +539,7 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
             targetSpeedT = msg.substring(0,idx).toInt(); 
             targetSpeedS = msg.substring(idx+1).toInt(); 
             lastControlTime = millis(); 
+            Serial.printf("⚡ WS Control -> T:%d, S:%d\n", targetSpeedT, targetSpeedS);
         }
     }
 }
