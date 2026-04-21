@@ -21,7 +21,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-const char* CURRENT_VERSION = "2026.04.21.02"; // 目前韌體版本
+#define CURRENT_VERSION "2026.04.21.04" // UI 拆分：首頁 D-Pad，次頁 Joystick
 WebServer server(80);                // 實例化同步 Web Server
 
 // LEDC PWM 設定 (保持不變)
@@ -92,149 +92,150 @@ void loadMotorConfig();
 void saveMotorConfig();
 void performGitHubCloudUpdate();
 void checkAndPerformAutoUpdate();
+void handleRoot();
+void handleJoystick();
 
 // --- HTML 網頁內容 ---
-const char* HTML_CONTENT = R"rawliteral(
+static const char* JOYSTICK_PAGE_HTML = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VibeRcer 搖桿控制</title>
+    <title>Vibe Racer 控制 (搖桿)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* 確保全螢幕高度和柔軟的背景色 */
-        body { 
-            background-color: #1f2937; 
-            color: #f9fafb; 
-            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
-            display: flex; 
-            justify-content: center; 
-            align-items: center; 
-            min-height: 100vh; 
-            margin: 0; 
-            padding: 1rem;
-        }
-        .container { 
-            max-width: 400px; 
-            width: 100%; 
-            padding: 20px; 
-        }
-        /* 搖桿圓盤樣式 */
+        body { background: #0f172a; color: #f9fafb; font-family: system-ui; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
+        .container { max-width: 400px; width: 100%; padding: 20px; }
         #joystick { 
-            position: relative; 
-            width: 100%;
-            padding-top: 100%; /* 1:1 比例 */
-            margin: 0 auto; 
-            border-radius: 50%; 
-            background: linear-gradient(145deg, #2d3748, #1a202c); 
+            position: relative; width: 100%; padding-top: 100%; margin: 0 auto; 
+            border-radius: 50%; background: linear-gradient(145deg, #2d3748, #1a202c); 
             box-shadow: 10px 10px 20px #171d26, -10px -10px 20px #273142, inset 0 0 10px rgba(0,0,0,0.5);
-            touch-action: none; /* 禁用瀏覽器預設的觸摸行為 */
+            touch-action: none;
         }
-        /* 實際可拖曳區域 (內縮 5% 讓邊緣有陰影效果) */
-        #joystick-inner {
-            position: absolute;
-            top: 5%; left: 5%; right: 5%; bottom: 5%;
-            width: 90%;
-            height: 90%;
-        }
-        /* 搖桿中心點 (Thumb) */
+        #joystick-inner { position: absolute; top: 5%; left: 5%; right: 5%; bottom: 5%; width: 90%; height: 90%; }
         #joystick-thumb {
-            position: absolute;
-            width: 70px; 
-            height: 70px;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            border-radius: 50%;
-            background: #4f46e5;
+            position: absolute; width: 70px; height: 70px; top: 50%; left: 50%;
+            transform: translate(-50%, -50%); border-radius: 50%; background: #4f46e5;
             box-shadow: 0 0 15px #4f46e5, inset 0 0 10px #7c3aed;
-            cursor: grab;
-            transition: box-shadow 0.1s;
         }
-        #joystick-thumb.active { cursor: grabbing; box-shadow: 0 0 25px #7c3aed, inset 0 0 15px #4f46e5; }
-        /* 狀態文字 */
-        #status { font-weight: 700; text-shadow: 0 0 5px rgba(79, 70, 229, 0.5); }
+        #joystick-thumb.active { box-shadow: 0 0 25px #7c3aed, inset 0 0 15px #4f46e5; }
     </style>
 </head>
 <body class="p-4">
     <div class="container bg-gray-800 rounded-xl shadow-2xl">
         <h1 class="text-3xl font-extrabold text-center text-indigo-400 mb-2">Vibe Racer</h1>
-        <p class="text-center text-sm mb-4 text-gray-400">
-            裝置: <span id="hostname">%HOSTNAME%</span> | <span id="ipaddress">%IPADDRESS%</span>
+        <p class="text-center text-[10px] mb-4 text-gray-500 uppercase tracking-widest">
+            模式: 虛擬搖桿 | <a href="/" class="text-indigo-400 underline decoration-indigo-400/30">切換至 D-Pad</a>
         </p>
-
-        <!-- 電量與診斷資訊 -->
         <div class="bg-gray-900/50 rounded-lg p-3 mb-6 border border-gray-700">
             <div class="flex justify-between items-center mb-3">
-                <div class="text-left">
-                    <p class="text-xs text-gray-500 uppercase tracking-wider font-bold">電池電壓 Battery</p>
-                    <p class="text-xl font-mono font-bold text-green-400"><span id="val_v">0.00</span>V</p>
-                </div>
-                <div class="text-right">
-                    <p class="text-xs text-gray-500 uppercase tracking-wider font-bold">即時功率 Realtime</p>
-                    <p class="text-sm font-mono text-indigo-300">T: <span id="val_rt">0</span> | S: <span id="val_rs">0</span></p>
-                </div>
+                <div class="text-left"><p class="text-[10px] text-gray-500 uppercase">電池電壓</p><p class="text-xl font-mono font-bold text-green-400"><span id="val_v">0.00</span>V</p></div>
+                <div class="text-right"><p class="text-[10px] text-gray-500 uppercase">即時功率</p><p class="text-sm font-mono text-indigo-300">T: <span id="val_rt">0</span> | S: <span id="val_rs">0</span></p></div>
             </div>
-            
-            <!-- 馬達參數儀表板 (New) -->
             <div class="grid grid-cols-2 gap-2 border-t border-gray-700 pt-3">
-                <div class="space-y-1">
-                    <p class="text-[10px] text-gray-500 font-bold uppercase tracking-tighter">加速配置 (T-Config)</p>
-                    <div class="flex space-x-1">
-                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">L:<span id="cfg_lt">-</span></span>
-                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">S:<span id="cfg_st">-</span></span>
-                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">K:<span id="cfg_kt">-</span></span>
-                    </div>
-                </div>
-                <div class="space-y-1 border-l border-gray-800 pl-2">
-                    <p class="text-[10px] text-gray-500 font-bold uppercase tracking-tighter">轉向配置 (S-Config)</p>
-                    <div class="flex space-x-1">
-                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">L:<span id="cfg_ls">-</span></span>
-                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">S:<span id="cfg_ss">-</span></span>
-                        <span class="bg-indigo-500/10 text-indigo-300 text-[10px] px-1.5 py-0.5 rounded border border-indigo-500/20">K:<span id="cfg_ks">-</span></span>
-                    </div>
-                </div>
+                <div class="space-y-1"><p class="text-[10px] text-gray-500 uppercase">加速檔位</p><div class="flex space-x-1"><span class="bg-indigo-500/10 text-indigo-300 text-[9px] px-1 rounded">L:<span id="cfg_lt"></span></span><span class="bg-indigo-500/10 text-indigo-300 text-[9px] px-1 rounded">S:<span id="cfg_st"></span></span></div></div>
+                <div class="space-y-1"><p class="text-[10px] text-gray-500 uppercase">轉向檔位</p><div class="flex space-x-1"><span class="bg-indigo-500/10 text-indigo-300 text-[9px] px-1 rounded">L:<span id="cfg_ls"></span></span><span class="bg-indigo-500/10 text-indigo-300 text-[9px] px-1 rounded">S:<span id="cfg_ss"></span></span></div></div>
             </div>
         </div>
-
-        <div id="joystick" class="mb-6">
-            <div id="joystick-inner">
-                 <div id="joystick-thumb"></div>
-            </div>
-        </div>
-
-        <div class="text-center space-y-2 pb-4">
-            <p class="text-xl">狀態: <span id="status" class="text-green-400">靜止</span></p>
-            <p class="text-xs text-gray-500">
-                目標 X: <span id="val_x">0</span> | 目標 Y: <span id="val_y">0</span>
-            </p>
-            <div class="pt-4">
-                <a href="/update_factory" class="text-[10px] text-gray-600 hover:text-indigo-400">韌體維護 (Factory OTA)</a>
-            </div>
-        </div>
+        <div id="joystick" class="mb-6"><div id="joystick-inner"><div id="joystick-thumb"></div></div></div>
+        <p id="status" class="text-center text-sm font-bold text-green-400 mb-4 tracking-widest">● 靜止 ●</p>
+        <div class="p-4 border-t border-gray-700 text-center text-[10px] text-gray-500"><a href="/update_factory" class="hover:text-indigo-400">韌體維修中心</a> | Ver 2026.04.21.04</div>
     </div>
-
     <script>
-        const joystickContainer = document.getElementById('joystick'); 
-        const joystick = document.getElementById('joystick-inner'); 
-        const thumb = document.getElementById('joystick-thumb');
-        const statusEl = document.getElementById('status');
-        const valXEl = document.getElementById('val_x');
-        const valYEl = document.getElementById('val_y');
-        const valVEl = document.getElementById('val_v');
-        const valRTEl = document.getElementById('val_rt');
-        const valRSELEl = document.getElementById('val_rs');
-        
-        const DEADZONE_PWM = 20; 
-        const maxRadius = joystick.clientWidth / 2;
-        let isDragging = false;
-        let controlInterval;
-        let lastMotorT = 0;
-        let lastMotorS = 0;
-        const baseIp = ''; 
-        
-        function updateMotorValues(offsetX, offsetY) {
+        const joystick = document.getElementById('joystick'); const thumb = document.getElementById('joystick-thumb'); const statusEl = document.getElementById('status');
+        const valVEl = document.getElementById('val_v'); const valRTEl = document.getElementById('val_rt'); const valRSELEl = document.getElementById('val_rs');
+        const DEADZONE_PWM = 20, maxRadius = joystick.clientWidth/2;
+        let isDragging = false, controlInterval, lastMotorT = 0, lastMotorS = 0;
+        function fetchConfig() { fetch('/config').then(r => r.json()).then(d => {
+            document.getElementById('cfg_lt').textContent=d.pwmEffectiveLimitT; document.getElementById('cfg_st').textContent=d.rampAccelStepT;
+            document.getElementById('cfg_ls').textContent=d.pwmEffectiveLimitS; document.getElementById('cfg_ss').textContent=d.rampAccelStepS;
+        }); }
+        fetchConfig();
+        function updateMotorValues(ox, oy) {
+            const ds = Math.sqrt(ox*ox + oy*oy); const mg = Math.min(1.0, ds/maxRadius);
+            let rx = ox/maxRadius, ry = oy/maxRadius; let maxAxial = Math.max(Math.abs(rx), Math.abs(ry));
+            if (maxAxial > 0) { let sc = mg/maxAxial; rx *= sc; ry *= sc; }
+            lastMotorS = Math.round(rx*255); lastMotorT = Math.round(ry*255);
+            if (Math.abs(lastMotorT) < DEADZONE_PWM) lastMotorT = 0;
+            if (Math.abs(lastMotorS) < DEADZONE_PWM) lastMotorS = 0;
+            statusEl.textContent = (lastMotorT===0 && lastMotorS===0) ? "● 靜止 ●" : "● 運行中 ●";
+        }
+        function sendControl(T, S) { fetch(`/control?t=${T}&s=${S}`).then(r => r.json()).then(data => { valVEl.textContent = data.v.toFixed(2); valRTEl.textContent = data.rt; valRSELEl.textContent = data.rs; }); }
+        function stop() { isDragging = false; clearInterval(controlInterval); thumb.style.left = '50%'; thumb.style.top = '50%'; thumb.style.transform = 'translate(-50%, -50%)'; lastMotorT = 0; lastMotorS = 0; sendControl(0,0); }
+        joystick.addEventListener('mousedown', e => { isDragging=true; thumb.classList.add('active'); startComm(); });
+        joystick.addEventListener('touchstart', e => { isDragging=true; thumb.classList.add('active'); startComm(); });
+        document.addEventListener('mousemove', e => {
+            if(!isDragging) return; const rect = joystick.getBoundingClientRect();
+            let ox = (e.touches?e.touches[0].clientX:e.clientX) - (rect.left+maxRadius);
+            let oy = (e.touches?e.touches[0].clientY:e.clientY) - (rect.top+maxRadius);
+            const ds = Math.sqrt(ox*ox+oy*oy); if(ds>maxRadius){ const an=Math.atan2(oy,ox); ox=maxRadius*Math.cos(an); oy=maxRadius*Math.sin(an); }
+            thumb.style.left=`${maxRadius+ox}px`; thumb.style.top=`${maxRadius+oy}px`; thumb.style.transform='translate(-50%,-50%)';
+            updateMotorValues(ox, -oy);
+        });
+        document.addEventListener('touchmove', e => { if(isDragging) e.preventDefault(); }, {passive:false});
+        document.addEventListener('mouseup', stop); document.addEventListener('touchend', stop);
+        function startComm() { if(controlInterval) clearInterval(controlInterval); controlInterval = setInterval(()=>sendControl(lastMotorT, lastMotorS), 50); }
+    </script>
+</body>
+</html>)rawliteral";
+
+static const char* DPAD_PAGE_HTML = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vibe Racer 控制 (D-Pad)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; color: #f9fafb; font-family: system-ui; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
+        .container { max-width: 400px; width: 100%; padding: 20px; }
+        .dpad-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; width: 210px; margin: 0 auto; }
+        .btn-dpad { aspect-ratio: 1/1; border-radius: 16px; background: #1e293b; border: 1px solid rgba(255,255,255,0.1); display: flex; justify-content: center; align-items: center; cursor: pointer; transition: 0.1s; -webkit-tap-highlight-color: transparent; }
+        .btn-dpad:active { background: #4f46e5; transform: scale(0.95); box-shadow: 0 0 15px rgba(79, 70, 229, 0.4); }
+        .btn-dpad svg { width: 32px; height: 32px; color: #94a3b8; }
+        .btn-dpad:active svg { color: white; }
+    </style>
+</head>
+<body class="p-4">
+    <div class="container bg-gray-800 rounded-2xl shadow-2xl overflow-hidden">
+        <div class="p-6 bg-indigo-600/10 border-b border-indigo-500/20 mb-6 text-center">
+            <h1 class="text-2xl font-bold text-indigo-400">Vibe Racer</h1>
+            <p class="text-[10px] mt-1 text-gray-500 uppercase tracking-widest">測試模式: D-Pad | <a href="/joystick" class="text-indigo-400 underline">進入搖桿</a></p>
+        </div>
+        <div class="px-6 mb-8">
+            <div class="bg-gray-900/50 rounded-xl p-4 border border-gray-700">
+                <div class="flex justify-between items-center mb-4 text-left">
+                    <div><p class="text-[10px] text-gray-500 uppercase">電池電壓</p><p class="text-lg font-mono font-bold text-green-400"><span id="val_v">0.00</span>V</p></div>
+                    <div class="text-right"><p class="text-[10px] text-gray-500 uppercase">即時功率</p><p class="text-xs font-mono text-indigo-300">T:<span id="val_rt">0</span> S:<span id="val_rs">0</span></p></div>
+                </div>
+                <div class="grid grid-cols-2 gap-2 border-t border-gray-700/50 pt-4 text-[9px]">
+                    <div><p class="text-gray-500 mb-1">T-CONFIG</p><div class="flex space-x-1"><span class="bg-indigo-500/5 px-1 rounded border border-white/5">L:<span id="cfg_lt"></span></span><span class="bg-indigo-500/5 px-1 rounded border border-white/5">S:<span id="cfg_st"></span></span></div></div>
+                    <div><p class="text-gray-500 mb-1 text-right">S-CONFIG</p><div class="flex space-x-1 justify-end"><span class="bg-indigo-500/5 px-1 rounded border border-white/5">L:<span id="cfg_ls"></span></span><span class="bg-indigo-500/5 px-1 rounded border border-white/5">S:<span id="cfg_ss"></span></span></div></div>
+                </div>
+            </div>
+        </div>
+        <div class="dpad-grid mb-10">
+            <div></div><div class="btn-dpad" onmousedown="mt(255,0)" ontouchstart="mt(255,0)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-8 8h16z"/></svg></div><div></div>
+            <div class="btn-dpad" onmousedown="mt(0,-255)" ontouchstart="mt(0,-255)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 12l8-8v16z"/></svg></div>
+            <div class="btn-dpad bg-red-500/10 border-red-500/20" onmousedown="sp()" ontouchstart="sp()"><div class="w-3 h-3 bg-red-500 rounded-sm"></div></div>
+            <div class="btn-dpad" onmousedown="mt(0,255)" ontouchstart="mt(0,255)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 12l-8-8v16z"/></svg></div>
+            <div></div><div class="btn-dpad" onmousedown="mt(-255,0)" ontouchstart="mt(-255,0)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20l-8-8h16z"/></svg></div><div></div>
+        </div>
+        <div class="p-4 bg-gray-900/40 text-center flex justify-between text-[10px] text-gray-600"><a href="/update_factory" class="hover:text-indigo-400 underline">維護中心</a><span>Ver 2026.04.21.04</span></div>
+    </div>
+    <script>
+        let cT=0, cS=0, itv=null;
+        function mt(t,s){ cT=t; cS=s; if(itv)clearInterval(itv); itv=setInterval(()=>sc(cT,cS),50); sc(cT,cS); }
+        function sp(){ cT=0; cS=0; if(itv)clearInterval(itv); sc(0,0); }
+        function sc(t,s){ fetch(`/control?t=${t}&s=${s}`).then(r=>r.json()).then(d=>{ document.getElementById('val_v').textContent=d.v.toFixed(2); document.getElementById('val_rt').textContent=d.rt; document.getElementById('val_rs').textContent=d.rs; }); }
+        fetch('/config').then(r=>r.json()).then(d=>{ document.getElementById('cfg_lt').textContent=d.pwmEffectiveLimitT; document.getElementById('cfg_st').textContent=d.rampAccelStepT; document.getElementById('cfg_ls').textContent=d.pwmEffectiveLimitS; document.getElementById('cfg_ss').textContent=d.rampAccelStepS; });
+        document.addEventListener('mouseup', sp); document.addEventListener('touchend', sp);
+    </script>
+</body>
+</html>)rawliteral";
+
             const distance = Math.sqrt(offsetX * offsetX + offsetY * offsetY);
             const magnitude = Math.min(1.0, distance / maxRadius);
             
@@ -973,6 +974,7 @@ void handleMotorConfig() {
 void setupWebServer() {
     Serial.println("--- 啟動 Web Server (STA 模式) ---");
     server.on("/", HTTP_GET, handleRoot);
+    server.on("/joystick", HTTP_GET, handleJoystick);
     server.on("/control", HTTP_GET, handleControl);
     server.on("/config", HTTP_ANY, handleMotorConfig); // 新增配置接口
     server.on("/update_factory", HTTP_GET, handleFactoryUpdate);
