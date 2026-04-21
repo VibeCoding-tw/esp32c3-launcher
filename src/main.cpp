@@ -423,7 +423,12 @@ void checkUdpControl() {
     }
 }
 
-void generateHostname() { uint8_t m[6]; WiFi.macAddress(m); globalHostname = "esp32c3-" + String(m[3],HEX)+String(m[4],HEX)+String(m[5],HEX); }
+void generateHostname() {    
+    globalHostname = "esp32c3-" + WiFi.macAddress(); 
+    globalHostname.replace(":", ""); 
+    globalHostname.toLowerCase(); 
+    Serial.printf("Generated Hostname: %s\n", globalHostname.c_str());
+}
 void connectToSavedWiFi() {
     preferences.begin("wifi-config", true); String s = preferences.getString("ssid",""); String p = preferences.getString("pass",""); preferences.end();
     if (s.length()>0) { WiFi.mode(WIFI_STA); WiFi.begin(s.c_str(), p.c_str()); }
@@ -440,7 +445,11 @@ void setup() {
 }
 
 void loop() {
-    webSocket.loop(); checkUdpControl();
+    if (servicesStarted) {
+        webSocket.loop();
+        checkUdpControl();
+        server.handleClient();
+    }
     if (WiFi.status() == WL_CONNECTED && !servicesStarted) {
         MDNS.begin(globalHostname.c_str());
         server.on("/", handleRoot); server.on("/joystick", handleJoystick); server.on("/control", handleControl);
