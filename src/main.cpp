@@ -362,6 +362,7 @@ const char MAINTENANCE_PAGE_HTML[] PROGMEM = R"rawliteral(
 
 // --- 自定義 Factory OTA 更新處理 ---
 void handleFactoryUpdate() {
+    server.sendHeader("Connection", "close");
     String html = MAINTENANCE_PAGE_HTML;
     html.replace("%HOSTNAME%", globalHostname);
     html.replace("%VERSION%", CURRENT_VERSION);
@@ -718,12 +719,14 @@ void motorRampTask() {
 
 // --- Web Server 處理函式 ---
 void handleRoot() {
+    server.sendHeader("Connection", "close");
     String html = DPAD_PAGE_HTML;
     html.replace("%VERSION%", CURRENT_VERSION);
     server.send(200, "text/html", html);
 }
 
 void handleJoystick() {
+    server.sendHeader("Connection", "close");
     String html = JOYSTICK_PAGE_HTML;
     html.replace("%VERSION%", CURRENT_VERSION);
     server.send(200, "text/html", html);
