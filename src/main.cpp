@@ -22,7 +22,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.09" 
+#define CURRENT_VERSION "2026.04.21.10" 
 WebServer server(80);                
 WebSocketsServer webSocket(81);      
 WiFiUDP udp;                         
@@ -387,6 +387,14 @@ void updateBatteryVoltage() {
     float v = (analogRead(BATT_ADC_PIN) / 4095.0) * 3.1 * 2.0;
     if (batteryVoltage < 0.1) batteryVoltage = v;
     else batteryVoltage = batteryVoltage * 0.9 + v * 0.1;
+    
+    if (batteryVoltage < 3.0 && batteryVoltage > 0.5) {
+        static unsigned long lastWarn = 0;
+        if (millis() - lastWarn > 10000) {
+            Serial.printf("⚠️ LOW VOLTAGE ALERT: %.2fV - Motors may not work!\n", batteryVoltage);
+            lastWarn = millis();
+        }
+    }
 }
 
 // --- Web Handlers ---
