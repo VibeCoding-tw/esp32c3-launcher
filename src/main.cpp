@@ -386,11 +386,75 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* p) { Serial.println("BLE Connected."); }
     void onDisconnect(BLEServer* p) { should_restart_advertising = true; }
 };
+
 class MyCharCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* p) {
-        String cmd = String(p->getValue().c_str());
-        int idx = cmd.indexOf(',');
-        if (idx > 0) { targetSpeedT = cmd.substring(0,idx).toInt(); targetSpeedS = cmd.substring(idx+1).toInt(); lastControlTime = millis(); }
+        std::string val = p->getValue();
+        if (val.length() > 0) {
+            String cmd = String(val.c_str());
+            int idx = cmd.indexOf(',');
+            if (idx > 0) { 
+                targetSpeedT = cmd.substring(0, idx).toInt(); 
+                targetSpeedS = cmd.substring(idx + 1).toInt(); 
+                lastControlTime = millis(); 
+            }
+        }
+    }
+};
+
+// [NEW] WiFi SSID 讀取/寫入回調
+class WiFiSsidCallbacks: public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic* p) {
+        preferences.begin("wifi-config", true);
+        String s = preferences.getString("ssid", "");
+        preferences.end();
+        p->setValue(s.c_str());
+    }
+    void onWrite(BLECharacteristic* p) {
+        std::string val = p->getValue();
+        if (val.length() > 0) {
+            ble_ssid = String(val.c_str());
+            Serial.printf("BLE: Received SSID: %s\n", ble_ssid.c_str());
+        }
+    }
+};
+
+// [NEW] WiFi Password 讀取/寫入回調
+class WiFiPassCallbacks: public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic* p) {
+        preferences.begin("wifi-config", true);
+        String p_val = preferences.getString("pass", "");
+        preferences.end();
+        p->setValue(p_val.c_str());
+    }
+    void onWrite(BLECharacteristic* p) {
+        std::string val = p->getValue();
+        if (val.length() > 0) {
+            ble_pass = String(val.c_str());
+            Serial.println("BLE: Received Password. Saving WiFi config...");
+            preferences.begin("wifi-config", false);
+            preferences.putString("ssid", ble_ssid);
+            preferences.putString("pass", ble_pass);
+            preferences.end();
+            Serial.println("✅ WiFi Config Saved. Restarting in 2s...");
+            delay(2000);
+            ESP.restart();
+        }
+    }
+};
+
+// [NEW] 馬達組態 (28-byte) 讀取/寫入回調
+class MotorConfigCallbacks: public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic* p) {
+        p->setValue((uint8_t*)&motorConfig, sizeof(MotorConfig_t));
+    }
+    void onWrite(BLECharacteristic* p) {
+        std::string rxValue = p->getValue();
+        if (rxValue.length() == sizeof(MotorConfig_t)) {
+            memcpy(&motorConfig, rxValue.data(), sizeof(MotorConfig_t));
+            saveMotorConfig();
+            Serial.println("✅ Motor Config updated via BLE.");
+        }
     }
 };
 
@@ -398,13 +462,48 @@ void setupBleServer_Bluedroid() {
     BLEDevice::init(globalHostname.c_str());
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
-    BLEService *pSvc = pServer->createService(MOTOR_SERVICE_UUID);
-    pControlCharacteristic = pSvc->createCharacteristic(MOTOR_CONTROL_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
+
+    // 1. 馬達服務 (控制 + 組態)
+    BLEService *pSvcMotor = pServer->createService(MOTOR_SERVICE_UUID);
+    
+    // 控制特徵值 (T,S 字串)
+    pControlCharacteristic = pSvcMotor->createCharacteristic(
+        MOTOR_CONTROL_CHAR_UUID, 
+        BLECharacteristic::PROPERTY_WRITE
+    );
     pControlCharacteristic->setCallbacks(new MyCharCallbacks());
-    pSvc->start();
+
+    // 組態特徵值 (28-byte Binary)
+    pMotorConfigCharacteristic = pSvcMotor->createCharacteristic(
+        MOTOR_CONFIG_CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+    );
+    pMotorConfigCharacteristic->setCallbacks(new MotorConfigCallbacks());
+    pSvcMotor->start();
+
+    // 2. 設定服務 (WiFi)
+    BLEService *pSvcConfig = pServer->createService(CONFIG_SERVICE_UUID);
+    
+    pSsidCharacteristic = pSvcConfig->createCharacteristic(
+        SSID_CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+    );
+    pSsidCharacteristic->setCallbacks(new WiFiSsidCallbacks());
+
+    pPassCharacteristic = pSvcConfig->createCharacteristic(
+        PASS_CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+    );
+    pPassCharacteristic->setCallbacks(new WiFiPassCallbacks());
+    pSvcConfig->start();
+
+    // 廣播設定
     BLEAdvertising *pAdv = BLEDevice::getAdvertising();
     pAdv->addServiceUUID(MOTOR_SERVICE_UUID);
+    pAdv->addServiceUUID(CONFIG_SERVICE_UUID);
     pAdv->start();
+    
+    Serial.println("🤖 BLE Services (Motor + WiFi Config) Started.");
 }
 
 void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
