@@ -13,22 +13,18 @@
 #include "esp32c3_gpio.h"
 #include "esp_ota_ops.h"
 
-// --- v12 Rescue Mode Content ---
-#define CURRENT_VERSION "2026.04.21.12"
-static const char* JOYSTICK_PAGE_HTML = "<html><body><h1>V12 Rescue Mode</h1><p>Web UI disabled for memory. Use BLE or Serial.</p><a href='/update_github'>Try GitHub Update Again</a></body></html>";
-static const char* DPAD_PAGE_HTML = "V12 Rescue Mode Active.";
+// --- v13 Emergency Bridge ---
+#define CURRENT_VERSION "2026.04.21.13"
+static const char* JOYSTICK_PAGE_HTML = "<html><body><h1>V13 Emergency Bridge (v13)</h1><p>Web UI disabled for survival. Use BLE or Serial.</p><a href='/update_github'>Cloud Update</a></body></html>";
+static const char* DPAD_PAGE_HTML = "v13 Active.";
 const char UPDATE_PAGE_HTML[] PROGMEM = "<html><body><h1>System Updating...</h1><p>Please wait 40 seconds.</p></body></html>";
-const char MAINTENANCE_PAGE_HTML[] PROGMEM = "<html><body><button onclick=\"location.href='/update_github'\">Start Update</button></body></html>";
 
 WebServer server(80);
-WebSocketsServer webSocket(81);
-WiFiUDP udp;
 volatile bool isUpdating = false;
-volatile int targetSpeedT = 0, currentSpeedT = 0;
-volatile int targetSpeedS = 0, currentSpeedS = 0;
-volatile unsigned long lastControlTime = 0;
-float batteryVoltage = 0.0;
-bool servicesStarted = false;
+volatile int targetSpeedT=0, currentSpeedT=0, targetSpeedS=0, currentSpeedS=0;
+volatile unsigned long lastControlTime=0;
+float batteryVoltage=0.0;
+bool servicesStarted=false;
 
 typedef struct {
     uint16_t controlTimeoutT; uint16_t controlTimeoutS;
@@ -72,15 +68,16 @@ void vTaskUpdate(void *p) {
     if (http.begin(client, (char*)p)) {
         if (http.GET() == 200) {
             int len = http.getSize();
-            const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+            // [CRITICAL] V13 使用更精確的切換邏輯
+            const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
             esp_ota_handle_t h = 0;
-            if (esp_ota_begin(part, len, &h) == ESP_OK) {
+            if (esp_ota_begin(update_part, len, &h) == ESP_OK) {
                 uint8_t b[2048]; WiFiClient* s = http.getStreamPtr(); size_t w = 0;
                 while (http.connected() && w < len) {
                     if (int c = s->readBytes(b, 2048)) { esp_ota_write(h, b, c); w += c; }
                     vTaskDelay(1);
                 }
-                if (w == len) { esp_ota_end(h); esp_ota_set_boot_partition(part); ESP.restart(); }
+                if (w == len) { esp_ota_end(h); esp_ota_set_boot_partition(update_part); ESP.restart(); }
             }
         }
     }
@@ -92,11 +89,6 @@ void performGitHubCloudUpdate() {
     xTaskCreate(vTaskUpdate, "OTA", 8192, (void*)u, 1, NULL);
 }
 
-void handleControl() {
-    targetSpeedT = server.arg("t").toInt(); targetSpeedS = server.arg("s").toInt();
-    lastControlTime = millis(); server.send(200, "text/plain", "OK");
-}
-
 void setup() {
     Serial.begin(115200); 
     preferences.begin("motor-config", true);
@@ -105,10 +97,7 @@ void setup() {
     preferences.end();
     pinMode(NSLEEP_PIN, OUTPUT); digitalWrite(NSLEEP_PIN, HIGH);
     analogReadResolution(12);
-    BLEDevice::init("Rescue-V12");
-    BLEServer *pS = BLEDevice::createServer();
-    BLEService *pM = pS->createService("4fafc201-1fb5-459e-8fcc-c0ffee00dead");
-    pM->start(); pS->getAdvertising()->start();
+    BLEDevice::init("Bridge-V13");
     
     preferences.begin("wifi-config", true);
     String s = preferences.getString("ssid",""), p = preferences.getString("pass","");
@@ -119,21 +108,11 @@ void setup() {
 void loop() {
     if (WiFi.status() == WL_CONNECTED && !servicesStarted) {
         server.on("/", [](){ server.send(200, "text/html", JOYSTICK_PAGE_HTML); });
-        server.on("/control", handleControl);
+        server.on("/control", [](){ targetSpeedT=server.arg("t").toInt();targetSpeedS=server.arg("s").toInt();lastControlTime=millis();server.send(200); });
         server.on("/update_github", [](){ server.send(200, "text/html", UPDATE_PAGE_HTML); performGitHubCloudUpdate(); });
         server.begin(); servicesStarted = true;
     }
     if (servicesStarted) server.handleClient();
     if (!isUpdating) { motorRampTask(); if(millis()-lastControlTime>1000){targetSpeedT=0;targetSpeedS=0;} }
-    
-    if (Serial.available()) {
-        String in = Serial.readStringUntil('\n'); in.trim();
-        if (in.startsWith("T:")) {
-            int c = in.indexOf(',');
-            targetSpeedT = in.substring(2, c).toInt();
-            targetSpeedS = in.substring(c+3).toInt();
-            lastControlTime = millis();
-        }
-    }
     delay(1);
 }
