@@ -42,7 +42,7 @@ jobs:
 
       - name: Extract Version
         run: |
-          grep 'const char\* CURRENT_VERSION =' src/main.cpp | cut -d '"' -f 2 > .pio/build/esp32c3-launcher/version.txt
+          grep '#define CURRENT_VERSION "' src/main.cpp | head -n 1 | cut -d '"' -f 2 > .pio/build/esp32c3-launcher/version.txt
           echo "Building Version: $(cat .pio/build/esp32c3-launcher/version.txt)"
 
       - name: Upload Artifacts

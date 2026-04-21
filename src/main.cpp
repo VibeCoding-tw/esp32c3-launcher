@@ -21,7 +21,7 @@
 
 // --- 全域變數 ---
 String globalHostname;               // 基於 MAC 位址的唯一 Hostname
-#define CURRENT_VERSION "2026.04.21.04" // UI 拆分：首頁 D-Pad，次頁 Joystick
+#define CURRENT_VERSION "2026.04.21.05" // UI 拆分：首頁 D-Pad，次頁 Joystick
 WebServer server(80);                // 實例化同步 Web Server
 
 // LEDC PWM 設定 (保持不變)
@@ -140,7 +140,7 @@ static const char* JOYSTICK_PAGE_HTML = R"rawliteral(
         </div>
         <div id="joystick" class="mb-6"><div id="joystick-inner"><div id="joystick-thumb"></div></div></div>
         <p id="status" class="text-center text-sm font-bold text-green-400 mb-4 tracking-widest">● 靜止 ●</p>
-        <div class="p-4 border-t border-gray-700 text-center text-[10px] text-gray-500"><a href="/update_factory" class="hover:text-indigo-400">韌體維修中心</a> | Ver 2026.04.21.04</div>
+        <div class="p-4 border-t border-gray-700 text-center text-[10px] text-gray-500"><a href="/update_factory" class="hover:text-indigo-400">韌體維修中心</a> | Ver %VERSION%</div>
     </div>
     <script>
         const joystick = document.getElementById('joystick'); const thumb = document.getElementById('joystick-thumb'); const statusEl = document.getElementById('status');
@@ -223,7 +223,7 @@ static const char* DPAD_PAGE_HTML = R"rawliteral(
             <div class="btn-dpad" onmousedown="mt(0,255)" ontouchstart="mt(0,255)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 12l-8-8v16z"/></svg></div>
             <div></div><div class="btn-dpad" onmousedown="mt(-255,0)" ontouchstart="mt(-255,0)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20l-8-8h16z"/></svg></div><div></div>
         </div>
-        <div class="p-4 bg-gray-900/40 text-center flex justify-between text-[10px] text-gray-600"><a href="/update_factory" class="hover:text-indigo-400 underline">維護中心</a><span>Ver 2026.04.21.04</span></div>
+        <div class="p-4 bg-gray-900/40 text-center flex justify-between text-[10px] text-gray-600"><a href="/update_factory" class="hover:text-indigo-400 underline">維護中心</a><span>Ver %VERSION%</span></div>
     </div>
     <script>
         let cT=0, cS=0, itv=null;
@@ -236,176 +236,6 @@ static const char* DPAD_PAGE_HTML = R"rawliteral(
 </body>
 </html>)rawliteral";
 
-            const distance = Math.sqrt(offsetX * offsetX + offsetY * offsetY);
-            const magnitude = Math.min(1.0, distance / maxRadius);
-            
-            // 使用 Scaled-to-Square 映射，確保在圓形搖桿邊緣的任何角度（包括斜角）都能輸出 255
-            let rawX = offsetX / maxRadius;
-            let rawY = offsetY / maxRadius;
-            
-            let maxAxial = Math.max(Math.abs(rawX), Math.abs(rawY));
-            if (maxAxial > 0) {
-                let scale = magnitude / maxAxial;
-                rawX *= scale;
-                rawY *= scale;
-            }
-
-            let speedS = Math.round(rawX * 255);
-            let speedT = Math.round(rawY * 255);
-
-            if (Math.abs(speedT) < DEADZONE_PWM) speedT = 0;
-            if (Math.abs(speedS) < DEADZONE_PWM) speedS = 0;
-
-            valYEl.textContent = speedT;
-            valXEl.textContent = speedS;
-            
-            let currentStatus = "靜止";
-            let statusColor = "text-green-400";
-            if (Math.abs(speedT) > 0 || Math.abs(speedS) > 0) {
-                 statusColor = "text-yellow-400";
-                 if (speedT > 50 && Math.abs(speedS) < 50) currentStatus = "前進中";
-                 else if (speedT < -50 && Math.abs(speedS) < 50) currentStatus = "後退中";
-                 else if (speedS > 50) currentStatus = "右轉中";
-                 else if (speedS < -50) currentStatus = "左轉中";
-                 else currentStatus = "移動中";
-            }
-            statusEl.textContent = currentStatus;
-            statusEl.className = "text-sm font-bold " + statusColor;
-
-            // 僅更新快取，實際發送由 setInterval 負責
-            lastMotorT = speedT;
-            lastMotorS = speedS;
-        }
-
-        // Config Elements Dashboard
-        const cfgLT = document.getElementById('cfg_lt');
-        const cfgST = document.getElementById('cfg_st');
-        const cfgKT = document.getElementById('cfg_kt');
-        const cfgLS = document.getElementById('cfg_ls');
-        const cfgSS = document.getElementById('cfg_ss');
-        const cfgKS = document.getElementById('cfg_ks');
-
-        function fetchConfig() {
-            fetch('/config')
-                .then(r => r.json())
-                .then(data => {
-                    if(cfgLT) cfgLT.textContent = data.pwmEffectiveLimitT;
-                    if(cfgST) cfgST.textContent = data.rampAccelStepT;
-                    if(cfgKT) cfgKT.textContent = data.pwmStartKickT;
-                    if(cfgLS) cfgLS.textContent = data.pwmEffectiveLimitS;
-                    if(cfgSS) cfgSS.textContent = data.rampAccelStepS;
-                    if(cfgKS) cfgKS.textContent = data.pwmStartKickS;
-                })
-                .catch(e => console.error('Config fetch failed', e));
-        }
-        fetchConfig();
-
-        function sendControl(T, S) {
-            fetch(`${baseIp}/control?t=${T}&s=${S}`)
-                .then(response => response.json())
-                .then(data => {
-                    // 更新電壓與即時 Ramp 數值
-                    if (data.v !== undefined) {
-                        valVEl.textContent = data.v.toFixed(2);
-                        // 低電壓警示 (假設 1S 鋰電池 3.4V)
-                        if (data.v < 3.4) valVEl.className = "text-red-500";
-                        else if (data.v < 3.6) valVEl.className = "text-yellow-400";
-                        else valVEl.className = "text-green-400";
-                    }
-                    if (data.rt !== undefined) valRTEl.textContent = data.rt;
-                    if (data.rs !== undefined) valRSELEl.textContent = data.rs;
-                })
-                .catch(err => console.error('Fetch error:', err));
-        }
-
-        function resetThumbPosition() {
-            thumb.style.left = '50%';
-            thumb.style.top = '50%';
-            thumb.style.transform = 'translate(-50%, -50%)';
-            thumb.classList.remove('active');
-        }
-
-        function stopMotors() {
-            isDragging = false;
-            if (controlInterval) clearInterval(controlInterval);
-            resetThumbPosition();
-            
-            // 歸零快取並發送最後一次停止命令
-            lastMotorT = 0;
-            lastMotorS = 0;
-            updateMotorValues(0, 0); 
-            sendControl(0, 0);
-        }
-
-        function handleMove(e) {
-            e.preventDefault();
-            if (!isDragging) return;
-
-            // 取得觸摸或滑鼠位置
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-
-            // 取得搖桿容器 (joystick-inner) 的位置
-            const rect = joystick.getBoundingClientRect();
-            const centerX = rect.left + maxRadius;
-            const centerY = rect.top + maxRadius;
-
-            // 1. 原始位移 (CSS 座標: X 向右為正, Y 向下為正)
-            let offsetX = clientX - centerX;
-            let offsetY = clientY - centerY; 
-            
-            // 2. 限制位移在搖桿圓盤內
-            const distance = Math.sqrt(offsetX * offsetX + offsetY * offsetY);
-            if (distance > maxRadius) {
-                const angle = Math.atan2(offsetY, offsetX);
-                offsetX = maxRadius * Math.cos(angle);
-                offsetY = maxRadius * Math.sin(angle);
-            }
-            
-            // 3. 更新搖桿中心點位置 (使用 CSS 座標)
-            const thumbX = maxRadius + offsetX;
-            const thumbY = maxRadius + offsetY; 
-
-            thumb.style.left = `${thumbX}px`;
-            thumb.style.top = `${thumbY}px`;
-            thumb.style.transform = 'translate(-50%, -50%)';
-
-            // 4. 更新馬達值 (使用 Cartesian 座標: Y 軸向上為正)
-            // 將 CSS Y 軸反轉: -offsetY
-            updateMotorValues(offsetX, -offsetY);
-        }
-
-        function handleStart(e) {
-            isDragging = true;
-            thumb.classList.add('active');
-            handleMove(e); // 立即更新一次位置和值
-
-            // 使用定時器發送控制命令 (20Hz / 每 50ms 一次)
-            // 這樣可以平衡「即時性」與「網路負擔」，避免因請求過快導致 ESP32 當機
-            if (controlInterval) clearInterval(controlInterval);
-            controlInterval = setInterval(() => {
-                sendControl(lastMotorT, lastMotorS);
-            }, 50); 
-        }
-
-        function handleEnd() {
-            stopMotors();
-        }
-
-        // --- 事件監聽 ---
-        joystick.addEventListener('mousedown', handleStart);
-        document.addEventListener('mousemove', handleMove);
-        document.addEventListener('mouseup', handleEnd);
-
-        joystick.addEventListener('touchstart', handleStart);
-        document.addEventListener('touchmove', handleMove);
-        joystickContainer.addEventListener('touchend', handleEnd); 
-
-        // 初始化時發送一次停止命令
-        stopMotors(); 
-    </script>
-</body>
-</html>)rawliteral";
 
 const char UPDATE_PAGE_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -741,7 +571,7 @@ void loadMotorConfig() {
         .pwmEffectiveLimitS = 255, 
         .rampAccelStepS = 20, // 提升轉向步長至 20
         .pwmStartKickS = 120,
-        .autoUpdateEnabled = 0, // 預設關閉自動更新以策安全
+        .autoUpdateEnabled = 1, // 預設開啟自動更新，確保使用者能取得最新版本
         .padding = 0
     };
 
@@ -888,10 +718,14 @@ void motorRampTask() {
 
 // --- Web Server 處理函式 ---
 void handleRoot() {
-    String html = HTML_CONTENT; 
-    String ipAddress = WiFi.localIP().toString();
-    html.replace("%HOSTNAME%", globalHostname);
-    html.replace("%IPADDRESS%", ipAddress);
+    String html = DPAD_PAGE_HTML;
+    html.replace("%VERSION%", CURRENT_VERSION);
+    server.send(200, "text/html", html);
+}
+
+void handleJoystick() {
+    String html = JOYSTICK_PAGE_HTML;
+    html.replace("%VERSION%", CURRENT_VERSION);
     server.send(200, "text/html", html);
 }
 
