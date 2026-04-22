@@ -42,8 +42,18 @@ jobs:
 
       - name: Extract Version
         run: |
-          grep '#define CURRENT_VERSION "' src/main.cpp | head -n 1 | cut -d '"' -f 2 > .pio/build/esp32c3-launcher/version.txt
-          echo "Building Version: $(cat .pio/build/esp32c3-launcher/version.txt)"
+          set -euo pipefail
+          VERSION=$(sed -n 's/.*CURRENT_VERSION = "\([^"]*\)".*/\1/p' src/main.cpp | head -n 1)
+          test -n "$VERSION"
+          printf '%s\n' "$VERSION" > .pio/build/esp32c3-launcher/version.txt
+          echo "Building Version: $VERSION"
+
+      - name: Verify Release Assets
+        run: |
+          set -euo pipefail
+          ls -lh .pio/build/esp32c3-launcher/firmware.bin .pio/build/esp32c3-launcher/version.txt
+          test -s .pio/build/esp32c3-launcher/firmware.bin
+          test -s .pio/build/esp32c3-launcher/version.txt
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
