@@ -3,313 +3,1013 @@
 #include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
-#include "esp_ota_ops.h"
-#include "esp_partition.h"
-#include "esp32c3_gpio.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <Preferences.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <WebSocketsServer.h>
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp32c3_gpio.h"
 
-// --- 全域變數 ---
+// --- Version / system constants ---
+static const char *CURRENT_VERSION = "2026.04.22.1";
+static const uint16_t PWM_MAX = 255;
+static const uint32_t RAMP_INTERVAL_MS = 10;
+static const uint32_t STEER_MAX_ON_TIME_MS = 3000;
+static const int STEER_HOLD_PWM = 230;
+static const uint32_t BATTERY_SAMPLE_INTERVAL_MS = 100;
+static const float ADC_REFERENCE_VOLTAGE = 3.3f;
+static const float ADC_COUNTS = 4095.0f;
+static const float BATTERY_DIVIDER_RATIO = 2.0f;   // 100k / 100k divider => measured voltage * 2
+static const float BATTERY_FILTER_ALPHA = 0.20f;
+static const float FACTORY_COPY_MIN_BATTERY = 3.6f;
+
+// --- Global state ---
 String globalHostname;
-#define CURRENT_VERSION "2026.04.21.15.1"
 WebServer server(80);
-WebSocketsServer webSocket(81);
-volatile bool isUpdating = false;
+Preferences preferences;
 
 typedef struct {
-    uint16_t controlTimeoutT; uint16_t controlTimeoutS;
-    int pwmEffectiveLimitT; int rampAccelStepT; int pwmStartKickT;
-    int pwmEffectiveLimitS; int rampAccelStepS; int pwmStartKickS;
-    uint8_t autoUpdateEnabled; uint8_t padding;
+    uint16_t controlTimeoutT;
+    uint16_t controlTimeoutS;
+    int pwmEffectiveLimitT;
+    int rampAccelStepT;
+    int pwmStartKickT;
+    int pwmEffectiveLimitS;
+    int rampAccelStepS;
+    int pwmStartKickS;
+    uint8_t autoUpdateEnabled;
+    uint8_t padding;
 } MotorConfig_t;
 
-Preferences preferences;
 MotorConfig_t motorConfig;
 
+volatile int targetSpeedT = 0;
+volatile int currentSpeedT = 0;
+volatile int targetSpeedS = 0;
+volatile int currentSpeedS = 0;
 volatile unsigned long lastThrottleTime = 0;
 volatile unsigned long lastSteerTime = 0;
-unsigned long steerStartTime = 0;
-volatile int targetSpeedT = 0, currentSpeedT = 0;
-volatile int targetSpeedS = 0, currentSpeedS = 0;
 unsigned long lastRampTime = 0;
+unsigned long steerStartTime = 0;
+bool throttleTimedOut = false;
+bool steerTimedOut = false;
+bool servicesStarted = false;
+volatile bool isUpdating = false;
+float batteryVoltage = 0.0f;
+float batteryVoltageMin = 0.0f;
+unsigned long lastBatterySample = 0;
 
-const char* CONFIG_SERVICE_UUID  = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const char* MOTOR_SERVICE_UUID   = "4fafc201-1fb5-459e-8fcc-c0ffee00dead";
+// --- BLE UUIDs ---
+static const char *CONFIG_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *MOTOR_SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c0ffee00dead";
 #define SSID_CHAR_UUID          "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define PASS_CHAR_UUID          "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 #define MOTOR_CONTROL_CHAR_UUID "4fafc202-1fb5-459e-8fcc-c0ffee01feed"
 #define MOTOR_CONFIG_CHAR_UUID  "4fafc203-1fb5-459e-8fcc-c0ffee02dead"
 
-BLEServer *pServer = NULL;
-BLECharacteristic *pControlCharacteristic = NULL, *pSsidCharacteristic = NULL, *pPassCharacteristic = NULL, *pMotorConfigCharacteristic = NULL;
-String ble_ssid, ble_pass;
-bool servicesStarted = false;
-float batteryVoltage = 0.0;
-unsigned long lastBatteryCheck = 0;
+BLEServer *pServer = nullptr;
+BLECharacteristic *pControlCharacteristic = nullptr;
+BLECharacteristic *pSsidCharacteristic = nullptr;
+BLECharacteristic *pPassCharacteristic = nullptr;
+BLECharacteristic *pMotorConfigCharacteristic = nullptr;
+String bleSsid;
 
-// --- 介面代碼 ---
 const char JOYSTICK_PAGE_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Vibe Racer</title><script src="https://cdn.tailwindcss.com"></script>
-<style>body{background:#0f172a;color:#fff;touch-action:none}#joystick{width:250px;height:250px;background:#1e293b;border-radius:50%;position:relative;margin:0 auto}#thumb{width:60px;height:60px;background:#4f46e5;border-radius:50%;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 15px #4f46e5}</style></head>
-<body class="flex flex-col items-center justify-center min-h-screen p-4">
-    <div class="bg-gray-800 p-6 rounded-3xl shadow-2xl w-full max-w-sm text-center">
-        <h1 class="text-2xl font-bold text-indigo-400 mb-4">Vibe Racer</h1>
-        <div id="joystick"><div id="thumb"></div></div>
-        <div class="mt-8 pt-4 border-t border-gray-700 text-[10px] text-gray-500">Ver %VERSION% | <a href="/update_factory" class="text-red-400">MAINTENANCE</a></div>
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vibe Racer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; color: #fff; touch-action: none; }
+        #joystick {
+            width: 280px; height: 280px; position: relative; margin: 0 auto;
+            border-radius: 9999px; background: radial-gradient(circle at 35% 35%, #334155, #0f172a);
+            box-shadow: inset 0 0 18px rgba(0,0,0,.45), 0 18px 45px rgba(15,23,42,.4);
+        }
+        #thumb {
+            width: 72px; height: 72px; position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%); border-radius: 9999px;
+            background: linear-gradient(145deg, #818cf8, #4f46e5);
+            box-shadow: 0 0 24px rgba(99,102,241,.7);
+        }
+        .card { background: rgba(30,41,59,.92); border: 1px solid rgba(148,163,184,.15); }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md space-y-4">
+        <div class="card rounded-3xl p-6 shadow-2xl text-center">
+            <h1 class="text-2xl font-bold text-indigo-400">Vibe Racer</h1>
+            <p class="text-xs text-slate-400 mt-1">Diag + square-mapped throttle/steering</p>
+            <div id="joystick" class="mt-6"><div id="thumb"></div></div>
+            <div class="grid grid-cols-2 gap-3 text-left text-sm mt-6">
+                <div class="bg-slate-900/70 rounded-2xl p-3">
+                    <div class="text-slate-400 text-xs">Battery</div>
+                    <div id="battery" class="text-xl font-semibold">--.- V</div>
+                    <div id="battery-min" class="text-xs text-slate-500">Min --.- V</div>
+                </div>
+                <div class="bg-slate-900/70 rounded-2xl p-3">
+                    <div class="text-slate-400 text-xs">Timeout</div>
+                    <div id="timeout" class="text-xl font-semibold">OK</div>
+                    <div class="text-xs text-slate-500">T / S watchdog</div>
+                </div>
+                <div class="bg-slate-900/70 rounded-2xl p-3">
+                    <div class="text-slate-400 text-xs">Target</div>
+                    <div id="target" class="font-mono">T:0 S:0</div>
+                </div>
+                <div class="bg-slate-900/70 rounded-2xl p-3">
+                    <div class="text-slate-400 text-xs">Realtime</div>
+                    <div id="realtime" class="font-mono">T:0 S:0</div>
+                </div>
+            </div>
+            <div class="mt-6 text-[10px] text-slate-500">
+                Ver %VERSION% |
+                <a href="/update_factory" class="text-amber-400">MAINTENANCE</a>
+            </div>
+        </div>
     </div>
+
     <script>
-        const j=document.getElementById('joystick'), t=document.getElementById('thumb');
-        let ws=new WebSocket(`ws://${location.hostname}:81`), dr=false;
-        function send(t,s){ if(ws.readyState===1) ws.send(`${t},${s}`); }
-        j.addEventListener('touchstart',()=>dr=true);
-        document.addEventListener('touchmove',e=>{
-            if(!dr)return; e.preventDefault(); const r=j.getBoundingClientRect(), m=125;
-            let ox=e.touches[0].clientX-(r.left+m), oy=e.touches[0].clientY-(r.top+m);
-            const ds=Math.sqrt(ox*ox+oy*oy); if(ds>m){ const a=Math.atan2(oy,ox); ox=m*Math.cos(a); oy=m*Math.sin(a); }
-            t.style.left=`${m+ox}px`; t.style.top=`${m+oy}px`;
-            let nx=ox/m, ny=-oy/m, mag=Math.sqrt(nx*nx+ny*ny);
-            if(mag>0){ let sc=1.0/Math.max(Math.abs(nx),Math.abs(ny)); nx*=sc; ny*=sc; }
-            send(Math.round(ny*255), Math.round(nx*255));
-        },{passive:false});
-        document.addEventListener('touchend',()=>{ dr=false; t.style.left=t.style.top='50%'; send(0,0); });
+        const joystick = document.getElementById("joystick");
+        const thumb = document.getElementById("thumb");
+        const batteryEl = document.getElementById("battery");
+        const batteryMinEl = document.getElementById("battery-min");
+        const timeoutEl = document.getElementById("timeout");
+        const targetEl = document.getElementById("target");
+        const realtimeEl = document.getElementById("realtime");
+
+        let dragging = false;
+        let lastT = 0;
+        let lastS = 0;
+
+        function clampToDisc(x, y, radius) {
+            const distance = Math.sqrt(x * x + y * y);
+            if (distance <= radius) return { x, y };
+            const angle = Math.atan2(y, x);
+            return { x: radius * Math.cos(angle), y: radius * Math.sin(angle) };
+        }
+
+        function squareMap(nx, ny) {
+            const maxAxis = Math.max(Math.abs(nx), Math.abs(ny));
+            if (maxAxis === 0) return { x: 0, y: 0 };
+            return { x: nx / maxAxis, y: ny / maxAxis };
+        }
+
+        function sendControl(t, s) {
+            lastT = t;
+            lastS = s;
+            fetch(`/control?t=${t}&s=${s}`).catch(() => {});
+        }
+
+        function resetThumb() {
+            thumb.style.left = "50%";
+            thumb.style.top = "50%";
+        }
+
+        function updateFromPoint(clientX, clientY) {
+            const rect = joystick.getBoundingClientRect();
+            const radius = rect.width / 2;
+            const centerX = rect.left + radius;
+            const centerY = rect.top + radius;
+            const clamped = clampToDisc(clientX - centerX, clientY - centerY, radius);
+
+            thumb.style.left = `${radius + clamped.x}px`;
+            thumb.style.top = `${radius + clamped.y}px`;
+
+            const normalized = squareMap(clamped.x / radius, -clamped.y / radius);
+            sendControl(Math.round(normalized.y * 255), Math.round(normalized.x * 255));
+        }
+
+        function pointerPoint(event) {
+            if (event.touches && event.touches.length > 0) {
+                return { x: event.touches[0].clientX, y: event.touches[0].clientY };
+            }
+            return { x: event.clientX, y: event.clientY };
+        }
+
+        function startDrag(event) {
+            dragging = true;
+            const point = pointerPoint(event);
+            updateFromPoint(point.x, point.y);
+        }
+
+        function moveDrag(event) {
+            if (!dragging) return;
+            event.preventDefault();
+            const point = pointerPoint(event);
+            updateFromPoint(point.x, point.y);
+        }
+
+        function endDrag() {
+            if (!dragging) return;
+            dragging = false;
+            resetThumb();
+            sendControl(0, 0);
+        }
+
+        function renderTelemetry(data) {
+            batteryEl.textContent = `${data.v.toFixed(2)} V`;
+            batteryMinEl.textContent = `Min ${data.vmin.toFixed(2)} V`;
+            targetEl.textContent = `T:${data.t} S:${data.s}`;
+            realtimeEl.textContent = `T:${data.rt} S:${data.rs}`;
+            timeoutEl.textContent = data.to || data.tos ? `T:${data.to ? "!" : "OK"} S:${data.tos ? "!" : "OK"}` : "OK";
+            timeoutEl.className = data.to || data.tos ? "text-xl font-semibold text-amber-400" : "text-xl font-semibold text-emerald-400";
+        }
+
+        async function refreshTelemetry() {
+            try {
+                const response = await fetch("/telemetry");
+                if (!response.ok) return;
+                const data = await response.json();
+                renderTelemetry(data);
+            } catch (_) {}
+        }
+
+        joystick.addEventListener("mousedown", startDrag);
+        joystick.addEventListener("touchstart", startDrag, { passive: true });
+        document.addEventListener("mousemove", moveDrag);
+        document.addEventListener("touchmove", moveDrag, { passive: false });
+        document.addEventListener("mouseup", endDrag);
+        document.addEventListener("touchend", endDrag);
+
+        resetThumb();
+        refreshTelemetry();
+        setInterval(refreshTelemetry, 250);
     </script>
-</body></html>)rawliteral";
+</body>
+</html>
+)rawliteral";
 
 const char MAINTENANCE_PAGE_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Maintenance</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="bg-slate-900 text-white p-6 flex justify-center items-center min-h-screen">
-    <div class="bg-slate-800 p-8 rounded-3xl shadow-2xl w-full max-w-md text-center">
-        <h1 class="text-2xl font-bold text-indigo-400 mb-6">維護中心 (%VERSION%)</h1>
-        <button onclick="if(confirm('啟動官方更新？\n這將更新工廠分區，請確保電源穩定。')) location.href='/update_official';" class="w-full py-5 bg-indigo-600 rounded-2xl font-bold shadow-lg mb-4">🛡️ 官方系統更新 (To Factory)</button>
-        <button onclick="if(confirm('啟動學生練習區更新？')) location.href='/update_student';" class="w-full py-5 bg-emerald-600 rounded-2xl font-bold shadow-lg mb-4">🚀 學生代碼更新 (To OTA_0)</button>
-        <div class="text-[10px] text-gray-500 mb-6 font-mono border p-2 border-white/10 rounded-lg">救援提醒：若開機失敗，請按住 GPIO 1 重新上電以回歸官方系統。</div>
-        <a href="/" class="text-xs text-indigo-400 underline">返回控制介面</a>
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maintenance</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-white min-h-screen flex items-center justify-center p-4">
+    <div class="bg-slate-800/90 border border-slate-700 rounded-3xl shadow-2xl max-w-md w-full p-8 text-center">
+        <h1 class="text-2xl font-bold text-indigo-400">維護中心</h1>
+        <p class="text-xs text-slate-400 mt-2">Version %VERSION%</p>
+        <div class="space-y-4 mt-8">
+            <button onclick="if(confirm('啟動官方更新？裝置會先進入 ota_0 驗證，成功後才回寫 factory。')) location.href='/update_official';" class="w-full rounded-2xl bg-indigo-600 py-5 font-bold shadow-lg">
+                官方系統更新 (To Factory)
+            </button>
+            <button onclick="if(confirm('啟動學生更新？裝置會寫入 ota_0 供測試。')) location.href='/update_student';" class="w-full rounded-2xl bg-emerald-600 py-5 font-bold shadow-lg">
+                學生代碼更新 (To OTA_0)
+            </button>
+        </div>
+        <div class="mt-6 rounded-2xl border border-white/10 bg-slate-900/70 p-4 text-xs text-slate-300">
+            救援模式：開機時將 GPIO 1 接地，可強制切回 factory。
+        </div>
+        <a href="/" class="inline-block mt-6 text-sm text-indigo-400 underline">返回控制介面</a>
     </div>
-</body></html>)rawliteral";
+</body>
+</html>
+)rawliteral";
 
-// --- 核心邏輯 ---
-void copyRunningToFactory() {
-    Serial.println("\n[SYSTEM] !!! STARTING COPY TO FACTORY !!!");
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-    if (!running || !factory) { Serial.println("[ERROR] Partitions not found!"); return; }
+// --- Helpers ---
+String telemetryJson() {
+    String json = "{";
+    json += "\"v\":" + String(batteryVoltage, 2) + ",";
+    json += "\"vmin\":" + String(batteryVoltageMin, 2) + ",";
+    json += "\"t\":" + String(targetSpeedT) + ",";
+    json += "\"s\":" + String(targetSpeedS) + ",";
+    json += "\"rt\":" + String(currentSpeedT) + ",";
+    json += "\"rs\":" + String(currentSpeedS) + ",";
+    json += "\"to\":" + String(throttleTimedOut ? 1 : 0) + ",";
+    json += "\"tos\":" + String(steerTimedOut ? 1 : 0);
+    json += "}";
+    return json;
+}
 
-    Serial.printf("[SYSTEM] Erasing factory partition (%d bytes)...\n", factory->size);
-    esp_partition_erase_range(factory, 0, factory->size);
-
-    uint8_t buf[4096];
-    for (size_t offset = 0; offset < running->size; offset += sizeof(buf)) {
-        esp_partition_read(running, offset, buf, sizeof(buf));
-        esp_partition_write(factory, offset, buf, sizeof(buf));
-        if ((offset % (128 * 1024)) == 0) Serial.printf("[SYSTEM] Progress: %d%%\n", (int)((offset * 100) / running->size));
+void saveMotorConfig() {
+    preferences.begin("motor-config", false);
+    preferences.putBytes("config", &motorConfig, sizeof(MotorConfig_t));
+    preferences.end();
+    if (pMotorConfigCharacteristic) {
+        pMotorConfigCharacteristic->setValue((uint8_t *)&motorConfig, sizeof(MotorConfig_t));
     }
-    Serial.println("[SYSTEM] Copy complete! Factory is now updated.");
+}
+
+void loadMotorConfig() {
+    const MotorConfig_t defaults = {
+        500, 2000,
+        255, 20, 60,
+        255, 20, 120,
+        0, 0
+    };
+
+    preferences.begin("motor-config", true);
+    if (preferences.getBytes("config", &motorConfig, sizeof(MotorConfig_t)) != sizeof(MotorConfig_t)) {
+        motorConfig = defaults;
+    }
+    preferences.end();
+}
+
+void generateHostname() {
+    globalHostname = "esp32c3-" + WiFi.macAddress();
+    globalHostname.replace(":", "");
+    globalHostname.toLowerCase();
+}
+
+void setMotorPwm(int throttle, int steer) {
+    throttle = constrain(throttle, -PWM_MAX, PWM_MAX);
+    steer = constrain(steer, -PWM_MAX, PWM_MAX);
+
+    if (throttle > 0) {
+        analogWrite(AIN2_PIN, 0);
+        analogWrite(AIN1_PIN, throttle);
+    } else if (throttle < 0) {
+        analogWrite(AIN1_PIN, 0);
+        analogWrite(AIN2_PIN, -throttle);
+    } else {
+        analogWrite(AIN1_PIN, 0);
+        analogWrite(AIN2_PIN, 0);
+    }
+
+    if (steer > 0) {
+        analogWrite(BIN1_PIN, 0);
+        analogWrite(BIN2_PIN, steer);
+    } else if (steer < 0) {
+        analogWrite(BIN2_PIN, 0);
+        analogWrite(BIN1_PIN, -steer);
+    } else {
+        analogWrite(BIN1_PIN, 0);
+        analogWrite(BIN2_PIN, 0);
+    }
+}
+
+void applyControlCommand(int rawT, int rawS) {
+    targetSpeedT = constrain(rawT, -motorConfig.pwmEffectiveLimitT, motorConfig.pwmEffectiveLimitT);
+    targetSpeedS = constrain(rawS, -motorConfig.pwmEffectiveLimitS, motorConfig.pwmEffectiveLimitS);
+
+    const unsigned long now = millis();
+    if (targetSpeedT != 0) {
+        lastThrottleTime = now;
+        throttleTimedOut = false;
+    }
+    if (targetSpeedS != 0) {
+        lastSteerTime = now;
+        steerTimedOut = false;
+        if (steerStartTime == 0) {
+            steerStartTime = now;
+        }
+    } else {
+        steerStartTime = 0;
+    }
+}
+
+void sampleBatteryVoltage() {
+    const unsigned long now = millis();
+    if (now - lastBatterySample < BATTERY_SAMPLE_INTERVAL_MS) {
+        return;
+    }
+    lastBatterySample = now;
+
+    const int raw = analogRead(BATT_ADC_PIN);
+    const float measured = (static_cast<float>(raw) / ADC_COUNTS) * ADC_REFERENCE_VOLTAGE * BATTERY_DIVIDER_RATIO;
+    if (batteryVoltage <= 0.01f) {
+        batteryVoltage = measured;
+        batteryVoltageMin = measured;
+        return;
+    }
+
+    batteryVoltage = (batteryVoltage * (1.0f - BATTERY_FILTER_ALPHA)) + (measured * BATTERY_FILTER_ALPHA);
+    if (batteryVoltageMin <= 0.01f || batteryVoltage < batteryVoltageMin) {
+        batteryVoltageMin = batteryVoltage;
+    }
+}
+
+int extractJsonInt(const String &json, const char *key, int fallback) {
+    const String quotedKey = "\"" + String(key) + "\"";
+    int keyPos = json.indexOf(quotedKey);
+    if (keyPos < 0) {
+        return fallback;
+    }
+    int colonPos = json.indexOf(':', keyPos + quotedKey.length());
+    if (colonPos < 0) {
+        return fallback;
+    }
+    int start = colonPos + 1;
+    while (start < json.length() && (json[start] == ' ' || json[start] == '\t' || json[start] == '\n' || json[start] == '\r')) {
+        ++start;
+    }
+    int end = start;
+    while (end < json.length() && (json[end] == '-' || isDigit(json[end]))) {
+        ++end;
+    }
+    if (end == start) {
+        return fallback;
+    }
+    return json.substring(start, end).toInt();
+}
+
+bool otaStateGetBool(const char *key, bool defaultValue) {
+    preferences.begin("ota-state", true);
+    const bool value = preferences.getBool(key, defaultValue);
+    preferences.end();
+    return value;
+}
+
+void otaStateSetBool(const char *key, bool value) {
+    preferences.begin("ota-state", false);
+    preferences.putBool(key, value);
+    preferences.end();
+}
+
+int otaStateGetInt(const char *key, int defaultValue) {
+    preferences.begin("ota-state", true);
+    const int value = preferences.getInt(key, defaultValue);
+    preferences.end();
+    return value;
+}
+
+void otaStateSetInt(const char *key, int value) {
+    preferences.begin("ota-state", false);
+    preferences.putInt(key, value);
+    preferences.end();
+}
+
+// --- OTA / boot flow ---
+bool copyRunningToFactory() {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        ESP_PARTITION_SUBTYPE_APP_FACTORY,
+        nullptr
+    );
+
+    if (!running || !factory) {
+        Serial.println("[OTA] Missing running/factory partition.");
+        return false;
+    }
+
+    if (batteryVoltage > 0.01f && batteryVoltage < FACTORY_COPY_MIN_BATTERY) {
+        Serial.printf("[OTA] Battery %.2fV below safe copy threshold.\n", batteryVoltage);
+        return false;
+    }
+
+    Serial.printf("[OTA] Copying running partition to factory (%u bytes).\n", static_cast<unsigned>(running->size));
+    esp_err_t err = esp_partition_erase_range(factory, 0, factory->size);
+    if (err != ESP_OK) {
+        Serial.printf("[OTA] Factory erase failed: %d\n", static_cast<int>(err));
+        return false;
+    }
+
+    uint8_t buffer[4096];
+    for (size_t offset = 0; offset < running->size; offset += sizeof(buffer)) {
+        const size_t remaining = static_cast<size_t>(running->size) - offset;
+        const size_t chunkSize = (remaining < sizeof(buffer)) ? remaining : sizeof(buffer);
+        err = esp_partition_read(running, offset, buffer, chunkSize);
+        if (err != ESP_OK) {
+            Serial.printf("[OTA] Partition read failed at %u: %d\n", static_cast<unsigned>(offset), static_cast<int>(err));
+            return false;
+        }
+
+        err = esp_partition_write(factory, offset, buffer, chunkSize);
+        if (err != ESP_OK) {
+            Serial.printf("[OTA] Partition write failed at %u: %d\n", static_cast<unsigned>(offset), static_cast<int>(err));
+            return false;
+        }
+    }
+
+    Serial.println("[OTA] Factory copy complete.");
+    return true;
 }
 
 void checkRescueKey() {
     pinMode(1, INPUT_PULLUP);
-    if (digitalRead(1) == LOW) {
-        Serial.println("\n[RESCUE] !!! GPIO 1 TRIGGERED - RESCUE MODE !!!");
-        const esp_partition_t* factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-        if (factory) {
-            esp_ota_set_boot_partition(factory);
-            Serial.println("[RESCUE] Boot partition set to FACTORY. Restarting...");
-            delay(1000); ESP.restart();
-        }
+    if (digitalRead(1) != LOW) {
+        return;
     }
+
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        ESP_PARTITION_SUBTYPE_APP_FACTORY,
+        nullptr
+    );
+    if (!factory) {
+        return;
+    }
+
+    Serial.println("[RESCUE] GPIO1 grounded, forcing boot back to factory.");
+    esp_ota_set_boot_partition(factory);
+    delay(300);
+    ESP.restart();
 }
 
-void vTaskUpdate(void *pvParameters) {
-    bool isOfficial = (bool)pvParameters;
-    isUpdating = true; 
-    Serial.printf("\n[OTA] Targeting Staging Area (OTA_0) | Official Update: %s\n", isOfficial ? "YES" : "NO");
-    
-    WiFiClientSecure client; client.setInsecure(); HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (http.begin(client, "https://github.com/vibe-coding-tw/esp32c3-launcher/releases/latest/download/firmware.bin")) {
-        if (http.GET() == 200) {
-            int len = http.getSize();
-            const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-            esp_ota_handle_t h = 0;
-            if (part && esp_ota_begin(part, len, &h) == ESP_OK) {
-                WiFiClient* s = http.getStreamPtr(); size_t w = 0; uint8_t b[4096];
-                while (http.connected() && w < len) {
-                    if (size_t c = s->readBytes(b, 4096)) { esp_ota_write(h, b, c); w += c; }
-                }
-                if (w == len) {
-                    esp_ota_end(h);
-                    if (isOfficial) {
-                        preferences.begin("ota-state", false);
-                        preferences.putBool("pending_factory", true);
-                        preferences.end();
-                    }
-                    esp_ota_set_boot_partition(part);
-                    Serial.println("[OTA] Success! Rebooting to OTA_0 for verification...");
-                    delay(1000); ESP.restart();
-                }
-            }
-        }
-        http.end();
-    }
-    isUpdating = false; vTaskDelete(NULL);
+void markBootSuccessTask(void *) {
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    otaStateSetBool("boot_success", true);
+    otaStateSetInt("boot_count", 0);
+    Serial.println("[OTA] Boot marked as successful.");
+    vTaskDelete(nullptr);
 }
 
-void setMotorPwm(int t, int s) {
-    if (t > 0) { analogWrite(AIN2_PIN, 0); analogWrite(AIN1_PIN, t); }
-    else if (t < 0) { analogWrite(AIN1_PIN, 0); analogWrite(AIN2_PIN, -t); }
-    else { analogWrite(AIN1_PIN, 0); analogWrite(AIN2_PIN, 0); }
-    if (s > 0) { analogWrite(BIN1_PIN, 0); analogWrite(BIN2_PIN, s); }
-    else if (s < 0) { analogWrite(BIN2_PIN, 0); analogWrite(BIN1_PIN, -s); }
-    else { analogWrite(BIN1_PIN, 0); analogWrite(BIN2_PIN, 0); }
-}
+void finalizeOfficialUpdateTask(void *) {
+    vTaskDelay(pdMS_TO_TICKS(10000));
 
-class MotorControlCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* p) {
-        std::string v = p->getValue();
-        if (v.length() > 0) {
-            String cmd = String(v.c_str()); int i = cmd.indexOf(',');
-            int t = cmd.substring(0, i).toInt(); int s = cmd.substring(i + 1).toInt();
-            if (t != 0) lastThrottleTime = millis();
-            if (s != 0) { lastSteerTime = millis(); if (steerStartTime == 0) steerStartTime = millis(); }
-            else { steerStartTime = 0; }
-            targetSpeedT = t; targetSpeedS = s;
-        }
-    }
-};
-
-class WiFiSsidCallbacks: public BLECharacteristicCallbacks { void onWrite(BLECharacteristic* p) { ble_ssid = String(p->getValue().c_str()); } };
-class WiFiPassCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* p) {
-        ble_pass = String(p->getValue().c_str());
-        preferences.begin("wifi-config", false); preferences.putString("ssid", ble_ssid); preferences.putString("pass", ble_pass); preferences.end();
-        delay(2000); ESP.restart();
-    }
-};
-
-void setup() {
-    Serial.begin(115200); delay(1000);
-    checkRescueKey();
-
-    // --- Soft Rollback Logic ---
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    if (running->subtype != ESP_PARTITION_SUBTYPE_APP_FACTORY) {
-        preferences.begin("ota-state", false);
-        bool boot_success = preferences.getBool("boot_success", false);
-        if (!boot_success) {
-            int boot_count = preferences.getInt("boot_count", 0);
-            if (boot_count >= 1) {
-                Serial.println("\n[ROLLBACK] !!! BOOT FAILED MULTIPLE TIMES. REVERTING TO FACTORY !!!");
-                preferences.putBool("boot_success", true); // Reset
-                preferences.putInt("boot_count", 0);
-                preferences.end();
-                const esp_partition_t* factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-                esp_ota_set_boot_partition(factory);
-                delay(500); ESP.restart();
-            } else {
-                preferences.putInt("boot_count", boot_count + 1);
-            }
-        }
-        preferences.end();
+    sampleBatteryVoltage();
+    if (!copyRunningToFactory()) {
+        otaStateSetBool("pending_factory", false);
+        Serial.println("[OTA] Factory copy skipped/failed; staying on current image.");
+        vTaskDelete(nullptr);
+        return;
     }
 
-    Serial.println("\n🚀 !!! VIBE RACER " CURRENT_VERSION " BOOTING !!!");
-    
-    // --- Official Update Staging Check ---
-    preferences.begin("ota-state", true);
-    bool pending = preferences.getBool("pending_factory", false);
-    preferences.end();
+    otaStateSetBool("pending_factory", false);
+    otaStateSetBool("boot_success", true);
 
-    if (pending && running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
-        Serial.println("[SYSTEM] Official update staging detected. Verifying & Copying to Factory...");
-        // In a real product, we would check SHA256 here.
-        delay(2000); // Wait for stability
-        copyRunningToFactory();
-        preferences.begin("ota-state", false);
-        preferences.putBool("pending_factory", false);
-        preferences.putBool("boot_success", true); 
-        preferences.end();
-        Serial.println("[SYSTEM] Factory updated successfully. Rebooting to Factory...");
-        const esp_partition_t* factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        ESP_PARTITION_SUBTYPE_APP_FACTORY,
+        nullptr
+    );
+    if (factory) {
+        Serial.println("[OTA] Official update verified; rebooting into factory.");
         esp_ota_set_boot_partition(factory);
-        delay(1000); ESP.restart();
+        delay(300);
+        ESP.restart();
     }
 
-    // Mark boot success after initialization
-    xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(10000)); preferences.begin("ota-state", false); preferences.putBool("boot_success", true); preferences.putInt("boot_count", 0); preferences.end(); Serial.println("[SYSTEM] Boot marked as SUCCESS."); vTaskDelete(NULL); }, "SuccessTask", 2048, NULL, 1, NULL);
+    vTaskDelete(nullptr);
+}
 
-    preferences.begin("motor-config", true);
-    if (preferences.getBytes("config", &motorConfig, sizeof(MotorConfig_t)) != sizeof(MotorConfig_t)) motorConfig = {500, 2000, 255, 20, 60, 255, 20, 60, 1, 0};
-    preferences.end();
-    pinMode(NSLEEP_PIN, OUTPUT); digitalWrite(NSLEEP_PIN, HIGH);
-    analogReadResolution(12); globalHostname = "esp32c3-" + WiFi.macAddress(); globalHostname.replace(":",""); globalHostname.toLowerCase();
-    
+void performOtaTask(void *pvParameters) {
+    const bool isOfficial = reinterpret_cast<uintptr_t>(pvParameters) != 0;
+    isUpdating = true;
+
+    const char *url = "https://github.com/vibe-coding-tw/esp32c3-launcher/releases/latest/download/firmware.bin";
+    Serial.printf("[OTA] Downloading %s update to ota_0.\n", isOfficial ? "official" : "student");
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (!http.begin(client, url)) {
+        Serial.println("[OTA] HTTP begin failed.");
+        isUpdating = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    const int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.printf("[OTA] HTTP GET failed: %d\n", httpCode);
+        http.end();
+        isUpdating = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    const esp_partition_t *ota0 = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        ESP_PARTITION_SUBTYPE_APP_OTA_0,
+        nullptr
+    );
+    if (!ota0) {
+        Serial.println("[OTA] ota_0 partition not found.");
+        http.end();
+        isUpdating = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    esp_ota_handle_t otaHandle = 0;
+    esp_err_t err = esp_ota_begin(ota0, OTA_WITH_SEQUENTIAL_WRITES, &otaHandle);
+    if (err != ESP_OK) {
+        Serial.printf("[OTA] esp_ota_begin failed: %d\n", static_cast<int>(err));
+        http.end();
+        isUpdating = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    WiFiClient *stream = http.getStreamPtr();
+    uint8_t buffer[4096];
+    while (http.connected()) {
+        const int availableBytes = stream->available();
+        if (availableBytes <= 0) {
+            delay(1);
+            continue;
+        }
+
+        const size_t readSize = stream->readBytes(buffer, min(static_cast<int>(sizeof(buffer)), availableBytes));
+        if (readSize == 0) {
+            break;
+        }
+
+        err = esp_ota_write(otaHandle, buffer, readSize);
+        if (err != ESP_OK) {
+            Serial.printf("[OTA] esp_ota_write failed: %d\n", static_cast<int>(err));
+            esp_ota_abort(otaHandle);
+            http.end();
+            isUpdating = false;
+            vTaskDelete(nullptr);
+            return;
+        }
+    }
+
+    err = esp_ota_end(otaHandle);
+    http.end();
+    if (err != ESP_OK) {
+        Serial.printf("[OTA] esp_ota_end failed: %d\n", static_cast<int>(err));
+        isUpdating = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (isOfficial) {
+        otaStateSetBool("pending_factory", true);
+    }
+    otaStateSetBool("boot_success", false);
+    otaStateSetInt("boot_count", 0);
+    esp_ota_set_boot_partition(ota0);
+    Serial.println("[OTA] Download complete; rebooting into ota_0.");
+    delay(300);
+    ESP.restart();
+}
+
+void runRollbackChecks() {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running || running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+        return;
+    }
+
+    const bool bootSuccess = otaStateGetBool("boot_success", false);
+    if (bootSuccess) {
+        return;
+    }
+
+    const int bootCount = otaStateGetInt("boot_count", 0) + 1;
+    otaStateSetInt("boot_count", bootCount);
+
+    if (bootCount < 2) {
+        Serial.printf("[OTA] Pending verification boot count: %d\n", bootCount);
+        return;
+    }
+
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP,
+        ESP_PARTITION_SUBTYPE_APP_FACTORY,
+        nullptr
+    );
+    if (!factory) {
+        return;
+    }
+
+    Serial.println("[OTA] Soft rollback triggered; reverting to factory.");
+    otaStateSetBool("pending_factory", false);
+    otaStateSetBool("boot_success", true);
+    otaStateSetInt("boot_count", 0);
+    esp_ota_set_boot_partition(factory);
+    delay(300);
+    ESP.restart();
+}
+
+// --- Web handlers ---
+void handleRoot() {
+    String html = JOYSTICK_PAGE_HTML;
+    html.replace("%VERSION%", CURRENT_VERSION);
+    server.send(200, "text/html", html);
+}
+
+void handleTelemetry() {
+    server.send(200, "application/json", telemetryJson());
+}
+
+void handleControl() {
+    if (!server.hasArg("t") || !server.hasArg("s")) {
+        server.send(400, "application/json", "{\"error\":\"missing t or s\"}");
+        return;
+    }
+
+    applyControlCommand(server.arg("t").toInt(), server.arg("s").toInt());
+    server.send(200, "application/json", telemetryJson());
+}
+
+void updateConfigFromArgsOrJson() {
+    String plain = server.arg("plain");
+
+    auto readValue = [&](const char *argName, const char *jsonName, int currentValue) -> int {
+        if (server.hasArg(argName)) {
+            return server.arg(argName).toInt();
+        }
+        if (plain.length() > 0) {
+            return extractJsonInt(plain, jsonName, currentValue);
+        }
+        return currentValue;
+    };
+
+    motorConfig.controlTimeoutT = static_cast<uint16_t>(readValue("timeoutT", "controlTimeoutT", motorConfig.controlTimeoutT));
+    motorConfig.controlTimeoutS = static_cast<uint16_t>(readValue("timeoutS", "controlTimeoutS", motorConfig.controlTimeoutS));
+    motorConfig.pwmEffectiveLimitT = readValue("limitT", "pwmEffectiveLimitT", motorConfig.pwmEffectiveLimitT);
+    motorConfig.rampAccelStepT = readValue("stepT", "rampAccelStepT", motorConfig.rampAccelStepT);
+    motorConfig.pwmStartKickT = readValue("kickT", "pwmStartKickT", motorConfig.pwmStartKickT);
+    motorConfig.pwmEffectiveLimitS = readValue("limitS", "pwmEffectiveLimitS", motorConfig.pwmEffectiveLimitS);
+    motorConfig.rampAccelStepS = readValue("stepS", "rampAccelStepS", motorConfig.rampAccelStepS);
+    motorConfig.pwmStartKickS = readValue("kickS", "pwmStartKickS", motorConfig.pwmStartKickS);
+    motorConfig.autoUpdateEnabled = static_cast<uint8_t>(readValue("autoUpdateEnabled", "autoUpdateEnabled", motorConfig.autoUpdateEnabled));
+
+    motorConfig.pwmEffectiveLimitT = constrain(motorConfig.pwmEffectiveLimitT, 0, PWM_MAX);
+    motorConfig.rampAccelStepT = constrain(motorConfig.rampAccelStepT, 1, PWM_MAX);
+    motorConfig.pwmStartKickT = constrain(motorConfig.pwmStartKickT, 0, PWM_MAX);
+    motorConfig.pwmEffectiveLimitS = constrain(motorConfig.pwmEffectiveLimitS, 0, PWM_MAX);
+    motorConfig.rampAccelStepS = constrain(motorConfig.rampAccelStepS, 1, PWM_MAX);
+    motorConfig.pwmStartKickS = constrain(motorConfig.pwmStartKickS, 0, PWM_MAX);
+}
+
+void handleConfig() {
+    if (server.method() == HTTP_GET) {
+        String json = "{";
+        json += "\"controlTimeoutT\":" + String(motorConfig.controlTimeoutT) + ",";
+        json += "\"controlTimeoutS\":" + String(motorConfig.controlTimeoutS) + ",";
+        json += "\"pwmEffectiveLimitT\":" + String(motorConfig.pwmEffectiveLimitT) + ",";
+        json += "\"rampAccelStepT\":" + String(motorConfig.rampAccelStepT) + ",";
+        json += "\"pwmStartKickT\":" + String(motorConfig.pwmStartKickT) + ",";
+        json += "\"pwmEffectiveLimitS\":" + String(motorConfig.pwmEffectiveLimitS) + ",";
+        json += "\"rampAccelStepS\":" + String(motorConfig.rampAccelStepS) + ",";
+        json += "\"pwmStartKickS\":" + String(motorConfig.pwmStartKickS) + ",";
+        json += "\"autoUpdateEnabled\":" + String(motorConfig.autoUpdateEnabled);
+        json += "}";
+        server.send(200, "application/json", json);
+        return;
+    }
+
+    if (server.method() != HTTP_POST) {
+        server.send(405, "application/json", "{\"error\":\"method not allowed\"}");
+        return;
+    }
+
+    updateConfigFromArgsOrJson();
+    saveMotorConfig();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleMaintenance() {
+    String html = MAINTENANCE_PAGE_HTML;
+    html.replace("%VERSION%", CURRENT_VERSION);
+    server.send(200, "text/html", html);
+}
+
+void setupWebServices() {
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/telemetry", HTTP_GET, handleTelemetry);
+    server.on("/control", HTTP_GET, handleControl);
+    server.on("/config", HTTP_ANY, handleConfig);
+    server.on("/update_factory", HTTP_GET, handleMaintenance);
+    server.on("/update_official", HTTP_GET, []() {
+        server.send(200, "text/html", "<h1>Starting official OTA update...</h1><p>Device will reboot into ota_0, verify, then copy back to factory.</p>");
+        xTaskCreate(performOtaTask, "ota-official", 8192, reinterpret_cast<void *>(1), 1, nullptr);
+    });
+    server.on("/update_student", HTTP_GET, []() {
+        server.send(200, "text/html", "<h1>Starting student OTA update...</h1><p>Device will reboot into ota_0.</p>");
+        xTaskCreate(performOtaTask, "ota-student", 8192, reinterpret_cast<void *>(0), 1, nullptr);
+    });
+    server.onNotFound([]() {
+        server.send(404, "text/plain", "Not Found");
+    });
+    server.begin();
+
+    if (MDNS.begin(globalHostname.c_str())) {
+        Serial.printf("[NET] mDNS ready at %s.local\n", globalHostname.c_str());
+    }
+    ArduinoOTA.setHostname(globalHostname.c_str());
+    ArduinoOTA.begin();
+}
+
+// --- BLE callbacks ---
+class MotorControlCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) override {
+        const std::string value = pCharacteristic->getValue();
+        if (value.empty()) {
+            return;
+        }
+
+        const String command(value.c_str());
+        const int commaIndex = command.indexOf(',');
+        if (commaIndex <= 0) {
+            return;
+        }
+
+        applyControlCommand(command.substring(0, commaIndex).toInt(), command.substring(commaIndex + 1).toInt());
+    }
+};
+
+class MotorConfigCallbacks : public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic *pCharacteristic) override {
+        pCharacteristic->setValue((uint8_t *)&motorConfig, sizeof(MotorConfig_t));
+    }
+
+    void onWrite(BLECharacteristic *pCharacteristic) override {
+        const std::string value = pCharacteristic->getValue();
+        if (value.size() != sizeof(MotorConfig_t)) {
+            Serial.printf("[BLE] Invalid config write size: %u\n", static_cast<unsigned>(value.size()));
+            return;
+        }
+
+        memcpy(&motorConfig, value.data(), sizeof(MotorConfig_t));
+        motorConfig.pwmEffectiveLimitT = constrain(motorConfig.pwmEffectiveLimitT, 0, PWM_MAX);
+        motorConfig.rampAccelStepT = constrain(motorConfig.rampAccelStepT, 1, PWM_MAX);
+        motorConfig.pwmStartKickT = constrain(motorConfig.pwmStartKickT, 0, PWM_MAX);
+        motorConfig.pwmEffectiveLimitS = constrain(motorConfig.pwmEffectiveLimitS, 0, PWM_MAX);
+        motorConfig.rampAccelStepS = constrain(motorConfig.rampAccelStepS, 1, PWM_MAX);
+        motorConfig.pwmStartKickS = constrain(motorConfig.pwmStartKickS, 0, PWM_MAX);
+        saveMotorConfig();
+    }
+};
+
+class WifiSsidCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) override {
+        bleSsid = String(pCharacteristic->getValue().c_str());
+    }
+};
+
+class WifiPassCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) override {
+        const String password = String(pCharacteristic->getValue().c_str());
+        preferences.begin("wifi-config", false);
+        preferences.putString("ssid", bleSsid);
+        preferences.putString("pass", password);
+        preferences.end();
+        delay(200);
+        ESP.restart();
+    }
+};
+
+void setupBle() {
     BLEDevice::init(globalHostname.c_str());
     pServer = BLEDevice::createServer();
-    BLEService *pM = pServer->createService(MOTOR_SERVICE_UUID);
-    pControlCharacteristic = pM->createCharacteristic(MOTOR_CONTROL_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
+
+    BLEService *motorService = pServer->createService(MOTOR_SERVICE_UUID);
+    pControlCharacteristic = motorService->createCharacteristic(
+        MOTOR_CONTROL_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
     pControlCharacteristic->setCallbacks(new MotorControlCallbacks());
-    pMotorConfigCharacteristic = pM->createCharacteristic(MOTOR_CONFIG_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-    pMotorConfigCharacteristic->setValue((uint8_t*)&motorConfig, sizeof(MotorConfig_t));
-    pM->start();
 
-    BLEService *pC = pServer->createService(CONFIG_SERVICE_UUID);
-    pSsidCharacteristic = pC->createCharacteristic(SSID_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-    pSsidCharacteristic->setCallbacks(new WiFiSsidCallbacks());
-    pPassCharacteristic = pC->createCharacteristic(PASS_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-    pPassCharacteristic->setCallbacks(new WiFiPassCallbacks());
-    pC->start();
+    pMotorConfigCharacteristic = motorService->createCharacteristic(
+        MOTOR_CONFIG_CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pMotorConfigCharacteristic->setCallbacks(new MotorConfigCallbacks());
+    pMotorConfigCharacteristic->addDescriptor(new BLE2902());
+    pMotorConfigCharacteristic->setValue((uint8_t *)&motorConfig, sizeof(MotorConfig_t));
+    motorService->start();
 
-    BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-    pAdv->addServiceUUID(MOTOR_SERVICE_UUID); pAdv->addServiceUUID(CONFIG_SERVICE_UUID);
-    pAdv->start();
+    BLEService *configService = pServer->createService(CONFIG_SERVICE_UUID);
+    pSsidCharacteristic = configService->createCharacteristic(
+        SSID_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    pSsidCharacteristic->setCallbacks(new WifiSsidCallbacks());
 
-    preferences.begin("wifi-config", true); String s = preferences.getString("ssid",""), p = preferences.getString("pass",""); preferences.end();
-    if(s.length()>0) { WiFi.mode(WIFI_STA); WiFi.begin(s.c_str(), p.c_str()); }
+    pPassCharacteristic = configService->createCharacteristic(
+        PASS_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    pPassCharacteristic->setCallbacks(new WifiPassCallbacks());
+    configService->start();
+
+    BLEAdvertising *advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(MOTOR_SERVICE_UUID);
+    advertising->addServiceUUID(CONFIG_SERVICE_UUID);
+    advertising->setScanResponse(true);
+    advertising->start();
+}
+
+void connectSavedWifi() {
+    preferences.begin("wifi-config", true);
+    const String ssid = preferences.getString("ssid", "");
+    const String password = preferences.getString("pass", "");
+    preferences.end();
+
+    if (ssid.isEmpty()) {
+        Serial.println("[NET] No saved Wi-Fi credentials.");
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(globalHostname.c_str());
+    WiFi.begin(ssid.c_str(), password.c_str());
+}
+
+void motorRampTask() {
+    const unsigned long now = millis();
+    if (now - lastRampTime < RAMP_INTERVAL_MS) {
+        return;
+    }
+    lastRampTime = now;
+
+    auto rampOne = [](volatile int &current, int target, int step, int kick) {
+        if (target == 0) {
+            current = 0;
+            return;
+        }
+        if (current == 0) {
+            current = (target > 0) ? kick : -kick;
+        }
+        const int delta = target - current;
+        if (abs(delta) <= step) {
+            current = target;
+        } else {
+            current += (delta > 0) ? step : -step;
+        }
+    };
+
+    rampOne(currentSpeedT, targetSpeedT, motorConfig.rampAccelStepT, motorConfig.pwmStartKickT);
+    rampOne(currentSpeedS, targetSpeedS, motorConfig.rampAccelStepS, motorConfig.pwmStartKickS);
+
+    if (targetSpeedS == 0) {
+        steerStartTime = 0;
+    } else if (steerStartTime == 0) {
+        steerStartTime = now;
+    } else if (now - steerStartTime > STEER_MAX_ON_TIME_MS) {
+        currentSpeedS = constrain(currentSpeedS, -STEER_HOLD_PWM, STEER_HOLD_PWM);
+    }
+
+    currentSpeedT = constrain(currentSpeedT, -motorConfig.pwmEffectiveLimitT, motorConfig.pwmEffectiveLimitT);
+    currentSpeedS = constrain(currentSpeedS, -motorConfig.pwmEffectiveLimitS, motorConfig.pwmEffectiveLimitS);
+    setMotorPwm(currentSpeedT, currentSpeedS);
+}
+
+void enforceTimeouts() {
+    const unsigned long now = millis();
+
+    if (targetSpeedT != 0 && now - lastThrottleTime > motorConfig.controlTimeoutT) {
+        targetSpeedT = 0;
+        throttleTimedOut = true;
+    }
+    if (targetSpeedS != 0 && now - lastSteerTime > motorConfig.controlTimeoutS) {
+        targetSpeedS = 0;
+        steerTimedOut = true;
+        steerStartTime = 0;
+    }
+}
+
+void maybeStartServices() {
+    if (servicesStarted || WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    Serial.printf("[NET] Connected: %s\n", WiFi.localIP().toString().c_str());
+    setupWebServices();
+    servicesStarted = true;
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(300);
+
+    checkRescueKey();
+    runRollbackChecks();
+    loadMotorConfig();
+
+    pinMode(NSLEEP_PIN, OUTPUT);
+    digitalWrite(NSLEEP_PIN, HIGH);
+    analogReadResolution(12);
+    analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);
+    generateHostname();
+
+    sampleBatteryVoltage();
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 && otaStateGetBool("pending_factory", false)) {
+        xTaskCreate(finalizeOfficialUpdateTask, "finalize-official", 6144, nullptr, 1, nullptr);
+    }
+
+    xTaskCreate(markBootSuccessTask, "mark-boot-ok", 4096, nullptr, 1, nullptr);
+
+    setupBle();
+    connectSavedWifi();
+
+    Serial.printf("[BOOT] Vibe Racer %s on %s\n", CURRENT_VERSION, globalHostname.c_str());
+    Serial.printf("[CFG] Timeout T/S: %u / %u ms\n", motorConfig.controlTimeoutT, motorConfig.controlTimeoutS);
+    Serial.printf("[CFG] Steer limit/step/kick: %d / %d / %d\n", motorConfig.pwmEffectiveLimitS, motorConfig.rampAccelStepS, motorConfig.pwmStartKickS);
 }
 
 void loop() {
-    if (WiFi.status() == WL_CONNECTED && !servicesStarted) {
-        MDNS.begin(globalHostname.c_str());
-        server.on("/", [](){ String h=JOYSTICK_PAGE_HTML; h.replace("%VERSION%", CURRENT_VERSION); server.send(200, "text/html", h); });
-        server.on("/update_factory", [](){ String h=MAINTENANCE_PAGE_HTML; h.replace("%VERSION%", CURRENT_VERSION); server.send(200, "text/html", h); });
-        server.on("/update_official", [](){ server.send(200, "text/html", "<h1>Starting Official Update (to Factory)...</h1><p>Device will reboot to staging area first.</p>"); xTaskCreatePinnedToCore(vTaskUpdate, "OTA", 8192, (void*)true, 1, NULL, 1); });
-        server.on("/update_student", [](){ server.send(200, "text/html", "<h1>Starting Student Update (to OTA_0)...</h1>"); xTaskCreatePinnedToCore(vTaskUpdate, "OTA", 8192, (void*)false, 1, NULL, 1); });
-        server.begin(); webSocket.begin(); 
-        webSocket.onEvent([](uint8_t n, WStype_t t, uint8_t* pl, size_t l){
-            if(t==WStype_TEXT){
-                String msg=String((char*)pl); int i=msg.indexOf(',');
-                int tt=msg.substring(0,i).toInt(); int ss=msg.substring(i+1).toInt();
-                if(tt!=0) lastThrottleTime=millis();
-                if(ss!=0){ lastSteerTime=millis(); if(steerStartTime==0) steerStartTime=millis(); } else steerStartTime=0;
-                targetSpeedT=tt; targetSpeedS=ss;
-            }
-        });
-        servicesStarted = true;
-    }
-    if (servicesStarted) { server.handleClient(); webSocket.loop(); }
-    if (!isUpdating) {
-        unsigned long now = millis();
-        if(now - lastRampTime >= 10){
-            lastRampTime = now;
-            auto ramp = [](volatile int &cur, int tar, int st, int ki){
-                if(tar==0) cur=0; else { if(cur==0) cur=(tar>0)?ki:-ki; int d=tar-cur; if(abs(d)<=st) cur=tar; else cur+=(d>0)?st:-st; }
-            };
-            ramp(currentSpeedT, targetSpeedT, motorConfig.rampAccelStepT, motorConfig.pwmStartKickT);
-            ramp(currentSpeedS, targetSpeedS, motorConfig.rampAccelStepS, motorConfig.pwmStartKickS);
-            if(currentSpeedS != 0 && steerStartTime != 0 && (now - steerStartTime > 3000)) currentSpeedS = constrain(currentSpeedS, -230, 230);
-            setMotorPwm(currentSpeedT, currentSpeedS);
-        }
-        if(now - lastThrottleTime > 500) targetSpeedT = 0;
-        if(now - lastSteerTime > 2000) targetSpeedS = 0;
+    sampleBatteryVoltage();
+    maybeStartServices();
+
+    if (servicesStarted) {
+        server.handleClient();
         ArduinoOTA.handle();
     }
+
+    if (!isUpdating) {
+        enforceTimeouts();
+        motorRampTask();
+    }
+
     delay(1);
 }
