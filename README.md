@@ -21,13 +21,13 @@ Vibe Racer 是一個專為高品質遙控車設計的嵌入式控制系統。基
 *   **動態參數配置**：
     *   支提供 Web API 與 BLE 特徵點修改馬達校準參數（如加速步長、最高速限制、啟動電壓）。
     *   支援 NVS 非易失性存儲，參數修改後斷電不丟失。
-*   **維護與更新**：
-    *   **開機自動更新 (Auto-Update on Boot)**：(New 🛡️) 每次開機自動偵測 GitHub 最新版本並無感升級，支援 Web UI 一鍵開啟/關閉。
-    *   **GitHub Cloud OTA**：透過 GitHub Actions 自動編譯 `version.txt` 與 `firmware.bin`，實現精準的版本控管。
-    *   **美化維護頁面**：(New ✨) 內建現代化維修中心 (`/update_factory`)，提供版本資訊、自動更新開關與一鍵雲端更新功。
-    *   **ArduinoOTA**：支援標準網路埠韌體升級。
-    *   **mDNS**：可透過自定義域名（如 `esp32c3-xxxxxx.local`）直接訪問，無需記憶 IP。
-*   **硬體強制恢復原廠 (Factory Reset)**：(New ✨) 於啟動時將 **GPIO 1** 接地，可強制跳過 OTA 更新數據並返回 Factory 分區啟動。
+*   **分區分級更新策略 (Staged OTA)**：(New 🔄)
+    *   **暫存區 (ota_0)**：所有雲端更新（官方或學生代碼）皆先下載至暫存區運行與驗證。
+    *   **安全回寫 (Factory Copy)**：官方更新經 `ota_0` 驗證成功後，會自動回寫至 `factory` 分區，確保底層系統穩定。
+    *   **學生開發區**：學生代碼可直接於 `ota_0` 運行，不影響 `factory` 安全分區。
+*   **軟體自動回滾 (Soft Rollback)**：(New 🚨) 若新韌體在 `ota_0` 啟動後 10 秒內崩潰或斷電，系統將自動偵測並於下次開機回滾至 `factory` 分區。
+*   **硬體強制救援 (Rescue Mode)**：(New 🔘) 於啟動時將 **GPIO 1** 接地，可強制切換開機分區至 `factory`，無視任何 OTA 設定，確保 100% 救磚。
+*   **美化維護頁面**：(New ✨) 內建現代化維修中心 (`/update_factory`)，提供官方系統更新 (To Factory) 與學生代碼更新 (To OTA_0) 兩種模式。
 
 ---
 
@@ -43,7 +43,7 @@ Vibe Racer 是一個專為高品質遙控車設計的嵌入式控制系統。基
 | **BIN2_PIN** | 7 | 馬達 S (Steering) 輸入 2 |
 | **NSLEEP** | 4 | 馬達驅動器致能 (High Active) |
 | **BATT_ADC** | 0 | 電池分壓電壓採樣 (ADC1_CH0) |
-| **FACTORY_RST** | 1 | 恢復原廠設定按鈕 (地面觸發) |
+| **FACTORY_RESCUE** | 1 | 強制回歸 Factory 分區 (地面觸發) |
 
 ### 指示燈與狀態
 - **Serial**: 波特率定為 `115200`，輸出即時 Ramp 狀態與系統診斷資訊。
@@ -57,8 +57,9 @@ Vibe Racer 是一個專為高品質遙控車設計的嵌入式控制系統。基
 - **控制接口**: `/control?t=[speed]&s=[steering]`
     - **回應**: 返回 JSON：`{"v":電壓, "t":目標T, "s":目標S, "rt":即時T, "rs":即時S, "to":超時T, "tos":超時S}`。
 - **配置接口**: `/config` (GET 讀取 / POST 寫入 JSON)
-- **維護中心**: `/update_factory` (全新 UI 設定頁面，包含自動更新開關)
-- **雲端更新**: `/update_github` (跳轉至帶有進度追蹤的更新過場頁面)
+- **維護中心**: `/update_factory` (提供官方/學生雙重更新模式)
+- **官方更新**: `/update_official` (下載至 ota_0 並在成功後回寫 factory)
+- **學生更新**: `/update_student` (僅下載至 ota_0 供測試)
 
 ### BLE 藍牙介面
 - **服務 (Service)**:
